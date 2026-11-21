@@ -1,0 +1,47 @@
+From b739a61030f07b2dbc93862da09966f9ac725f9b Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sat, 21 Nov 2026 20:38:27 +0200
+Subject: [PATCH 23/23] tu: rebase the header pointers when copying an
+ acceleration structure
+
+The acceleration structure header keeps absolute pointers to itself and
+to its nodes, and the copy shader copied them as they were. A compacted
+BLAS then still pointed at its source, so a TLAS built from it walked
+the source nodes, and the GPU faulted once the application freed the
+source. Cyberpunk 2077 hit this as soon as ray tracing was enabled.
+
+Copy the header in one invocation and move both pointers to the
+destination. Serialized structures keep the same offset between the
+two, so deserializing works the same way.
+---
+ src/freedreno/vulkan/bvh/copy.comp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/vulkan/bvh/copy.comp b/src/freedreno/vulkan/bvh/copy.comp
+index 3eda0ea5498..fc34938f879 100644
+--- a/src/freedreno/vulkan/bvh/copy.comp
++++ b/src/freedreno/vulkan/bvh/copy.comp
+@@ -71,8 +71,19 @@ main(void)
+       instance_end = 0;
+    }
+ 
++   /* The header points at itself and at its nodes. A copy has to point at its
++    * own nodes, because the source may be freed right after a compaction.
++    */
++   if (global_id == 0) {
++      tu_accel_struct_header dst_header = DEREF(header);
++      dst_header.bvh_ptr = dst_header.bvh_ptr - dst_header.self_ptr + copy_dst_addr;
++      dst_header.self_ptr = copy_dst_addr;
++      DEREF(REF(tu_accel_struct_header)(copy_dst_addr)) = dst_header;
++   }
++
+    uint64_t size = DEREF(header).compacted_size;
+-   for (uint64_t offset = global_id * 16; offset < size; offset += increment) {
++   for (uint64_t offset = SIZEOF(tu_accel_struct_header) + global_id * 16; offset < size;
++        offset += increment) {
+       DEREF(REF(uvec4)(copy_dst_addr + offset)) =
+          DEREF(REF(uvec4)(copy_src_addr + offset));
+ 
+-- 
+2.53.0
+

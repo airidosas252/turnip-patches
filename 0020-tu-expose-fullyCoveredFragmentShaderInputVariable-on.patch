@@ -1,0 +1,163 @@
+From 1cd6e7928899aff7e4efa4950d77267aa2025343 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sat, 21 Nov 2026 10:16:08 +0200
+Subject: [PATCH 20/20] tu: expose fullyCoveredFragmentShaderInputVariable on
+ A8XX
+
+With inner conservative rasterization (INNERCONSERVATIVERASEN in
+GRAS_SU_CONSERVATIVE_RAS_CNTL and RB_RENDER_CNTL, plus UNK4 as the blob
+sets it) the hardware writes the inner coverage into the sample mask
+register, so FullyCovered is mask != 0.
+
+It is only enabled when the fragment shader reads it and conservative
+overestimate is on. This matches the register state of the proprietary
+driver.
+
+The multisample_with_fragment_shading_rate FullyCovered cases and the
+*_fully_covered_extra_overestimate cases fail, the same as on the
+proprietary driver.
+---
+ src/freedreno/ir3/ir3_compiler_nir.c | 13 ++++++++++++-
+ src/freedreno/ir3/ir3_shader.h       |  1 +
+ src/freedreno/vulkan/tu_device.cc    |  3 ++-
+ src/freedreno/vulkan/tu_pipeline.cc  | 21 +++++++++++++++++++--
+ 4 files changed, 34 insertions(+), 4 deletions(-)
+
+diff --git a/src/freedreno/ir3/ir3_compiler_nir.c b/src/freedreno/ir3/ir3_compiler_nir.c
+index cbb624b73c1..b937e491754 100644
+--- a/src/freedreno/ir3/ir3_compiler_nir.c
++++ b/src/freedreno/ir3/ir3_compiler_nir.c
+@@ -3052,12 +3052,23 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
+       dst[0] = ir3_COV(b, ctx->samp_id, TYPE_U16, TYPE_U32);
+       break;
+    case nir_intrinsic_load_sample_mask_in:
++   case nir_intrinsic_load_fully_covered:
+       if (!ctx->samp_mask_in) {
+          ctx->so->reads_smask = true;
+          ctx->samp_mask_in =
+             create_sysval_input(ctx, SYSTEM_VALUE_SAMPLE_MASK_IN, 0x1);
+       }
+-      dst[0] = ctx->samp_mask_in;
++      if (intr->intrinsic == nir_intrinsic_load_fully_covered) {
++         /* With inner conservative rasterization enabled the hw delivers the
++          * inner coverage in the sample mask register, which is nonzero for
++          * fully covered fragments (and replaces the regular sample mask).
++          */
++         ctx->so->reads_fully_covered = true;
++         dst[0] = ir3_CMPS_U(b, ctx->samp_mask_in, 0, create_immed(b, 0), 0);
++         dst[0]->cat2.condition = IR3_COND_NE;
++      } else {
++         dst[0] = ctx->samp_mask_in;
++      }
+       break;
+    case nir_intrinsic_load_user_clip_plane:
+       idx = nir_intrinsic_ucp_id(intr);
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index a9eb53e080c..ff84ce3389f 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -824,6 +824,7 @@ struct ir3_shader_variant {
+    bool reads_primid;
+    bool reads_shading_rate;
+    bool reads_smask;
++   bool reads_fully_covered;
+ 
+    /* sum of input components (scalar).  For frag shaders, it only counts
+     * the varying inputs:
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 0fd188e219d..26b05ec9186 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -1750,7 +1750,8 @@ tu_get_properties(struct tu_physical_device *pdevice,
+    props->conservativePointAndLineRasterization = false;
+    props->degenerateTrianglesRasterized = true;
+    props->degenerateLinesRasterized = false;
+-   props->fullyCoveredFragmentShaderInputVariable = false;
++   props->fullyCoveredFragmentShaderInputVariable =
++      pdevice->info->chip >= A8XX;
+    props->conservativeRasterizationPostDepthCoverage = false;
+ 
+    /* VK_EXT_fragment_density_map_offset */
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index b173bcf16f2..9f1daedf579 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -3782,6 +3782,7 @@ tu6_rast_size(struct tu_device *dev,
+               bool multiview,
+               bool per_view_viewport,
+               bool disable_fs,
++              bool fully_covered,
+               bool fdm)
+ {
+    if (CHIP == A6XX && dev->physical_device->info->props.is_a702) {
+@@ -3801,6 +3802,7 @@ tu6_emit_rast(struct tu_cs *cs,
+               bool multiview,
+               bool per_view_viewport,
+               bool disable_fs,
++              bool fully_covered,
+               bool fdm)
+ {
+    enum a5xx_line_mode line_mode =
+@@ -3867,6 +3869,12 @@ tu6_emit_rast(struct tu_cs *cs,
+       bool conservative_ras_en =
+          rs->conservative_mode ==
+          VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
++      /* With inner conservative rasterization the hw writes the inner coverage
++       * (all samples set for a fully covered fragment, 0 otherwise) to the
++       * sample mask register, where FullyCoveredEXT is read from. It is only
++       * meaningful, and only enabled, with conservative rasterization.
++       */
++      bool inner_conservative_ras_en = fully_covered && conservative_ras_en;
+       /* This is important to get D/S only draw calls to bypass invoking
+        * the fragment shader. The public documentation for Adreno states:
+        *  "Hint the driver to engage Fast-Z by using an empty fragment
+@@ -3879,7 +3887,8 @@ tu6_emit_rast(struct tu_cs *cs,
+             .fs_disable = disable_fs,
+             .raster_mode = TYPE_TILED,
+             .raster_direction = LR_TB,
+-            .conservativerasen = conservative_ras_en));
++            .conservativerasen = conservative_ras_en,
++            .innerconservativerasen = inner_conservative_ras_en));
+ 
+       if (CHIP >= A7XX) {
+          tu_cs_emit_regs(cs, GRAS_SU_RENDER_CNTL(CHIP, .fs_disable = disable_fs));
+@@ -3906,7 +3915,10 @@ tu6_emit_rast(struct tu_cs *cs,
+             FULL_PIXEL_SHIFT : HALF_PIXEL_SHIFT) : NO_SHIFT;
+       tu_cs_emit_regs(cs, GRAS_SU_CONSERVATIVE_RAS_CNTL(CHIP,
+             .conservativerasen = conservative_ras_en,
+-            .shiftamount = shift_amount));
++            .shiftamount = shift_amount,
++            .innerconservativerasen = inner_conservative_ras_en,
++            /* Set by the blob together with the inner bit, meaning unknown. */
++            .unk4 = inner_conservative_ras_en));
+ 
+       /* When FDM is enabled fragment's sample locations differ between full-size binning
+        * and non-identity FDM tiles, thus a small primitive that only covers a single sample
+@@ -4377,6 +4389,8 @@ tu_pipeline_builder_emit_state(struct tu_pipeline_builder *builder,
+                       builder->device->physical_device->info->props.has_hw_multiview,
+                    pipeline->program.per_view_viewport,
+                    pipeline->disable_fs.disable_fs,
++                   pipeline->shaders[MESA_SHADER_FRAGMENT] &&
++                      pipeline->shaders[MESA_SHADER_FRAGMENT]->variant->reads_fully_covered,
+                    builder->fragment_density_map);
+    DRAW_STATE_COND(ds, TU_DYNAMIC_STATE_DS,
+               attachments_valid,
+@@ -4646,12 +4660,15 @@ tu_emit_draw_state(struct tu_cmd_buffer *cmd)
+                    cmd->state.dirty & (TU_CMD_DIRTY_SUBPASS |
+                                        TU_CMD_DIRTY_FDM |
+                                        TU_CMD_DIRTY_PER_VIEW_VIEWPORT |
++                                       TU_CMD_DIRTY_FS |
+                                        TU_CMD_DIRTY_RAST),
+                    &cmd->vk.dynamic_graphics_state.rs,
+                    &cmd->vk.dynamic_graphics_state.vp,
+                    hw_multiview,
+                    cmd->state.per_view_viewport,
+                    cmd->state.disable_fs,
++                   cmd->state.shaders[MESA_SHADER_FRAGMENT] &&
++                      cmd->state.shaders[MESA_SHADER_FRAGMENT]->variant->reads_fully_covered,
+                    cmd->state.has_fdm);
+    DRAW_STATE_COND(ds, TU_DYNAMIC_STATE_DS,
+               cmd->state.dirty & TU_CMD_DIRTY_SUBPASS,
+-- 
+2.53.0
+

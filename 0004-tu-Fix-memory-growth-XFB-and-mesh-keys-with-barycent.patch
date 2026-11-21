@@ -1,0 +1,527 @@
+From 2d5efca5b1612d8836afbd8acbb81076496c42e6 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Thu, 22 Oct 2026 20:30:06 +0300
+Subject: [PATCH 04/20] tu: Fix memory growth, XFB and mesh keys with
+ barycentric libraries
+
+ - Retained post-link NIR used to be kept as live nir_shader objects in
+   the never-evicting device cache, about 250 KiB each. Store it
+   serialized per stage, and deserialize it only when a link needs it.
+   Keep it only when fragmentShaderBarycentric is enabled.
+ - Each graphics library now holds its own reference on the NIR it uses.
+ - Serialize retained NIR without stripping: stripping zeroes the
+   locations of function_temp variables, which a later LTO relink needs.
+ - On a partial pipeline cache hit, release the shaders that did hit
+   before recompiling. tu_compile_shaders treats shaders that are already
+   set as final, and linking them could crash in nir_opt_varyings.
+ - Move transform feedback outputs that collide with barycentric request
+   slots to free VAR slots, instead of failing pipeline creation.
+ - Include the mesh and task stages, and mesh_native, in the pipeline
+   hash, so that different mesh libraries no longer collide. Cache the
+   barycentric producer variant of the mesh stub VS.
+ - Fail pipeline creation with VK_ERROR_OUT_OF_HOST_MEMORY if
+   serialization runs out of memory.
+
+VK-CTS on Adreno 840 (KGSL), one deqp process per group,
+TU_EXPERIMENTAL=barycentric,mesh_shader,mesh_native:
+  dEQP-VK.fragment_shading_barycentric.pipeline_library.*     5521 / 0 / 1476
+    (peak RSS 1.6 GB and OOM before, 371 MB after)
+  dEQP-VK.fragment_shading_barycentric.fast_linked_library.*  5521 / 0 / 1476
+  dEQP-VK.fragment_shading_barycentric (monolithic)           5521 / 0 / 1476
+  dEQP-VK.pipeline.pipeline_library.graphics_library.*        812 / 20 / 4
+    (the same 20 failures as before)
+  dEQP-VK.transform_feedback.simple.*                         4994 / 0 / 2905
+  dEQP-VK.mesh_shader.ext.*                                   26391 / 0 / 547
+---
+ .../vulkan/tu_nir_lower_fs_barycentric.cc     |  39 +++-
+ src/freedreno/vulkan/tu_pipeline.cc           | 205 ++++++++++++------
+ src/freedreno/vulkan/tu_pipeline.h            |   8 +-
+ src/freedreno/vulkan/tu_shader.cc             |   4 +-
+ 4 files changed, 177 insertions(+), 79 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_nir_lower_fs_barycentric.cc b/src/freedreno/vulkan/tu_nir_lower_fs_barycentric.cc
+index 85f0528d436..7e9c4101d74 100644
+--- a/src/freedreno/vulkan/tu_nir_lower_fs_barycentric.cc
++++ b/src/freedreno/vulkan/tu_nir_lower_fs_barycentric.cc
+@@ -24,6 +24,8 @@ struct bary_state {
+ 
+    uint64_t per_vertex_only;
+    uint64_t remove;
++   uint64_t moved;
++   uint8_t move_to[64];
+    unsigned id_flat_slot;
+    struct bary_map id;
+    nir_def *rot, *is_line, *is_point;
+@@ -329,8 +331,18 @@ lower_producer(struct bary_state *s)
+          store_dword(b, nir_channel(b, intr->src[0].ssa, i), &s->map[slot][comp]);
+       }
+ 
+-      if (slot < 64 && (s->remove & BITFIELD64_BIT(slot)))
+-         nir_instr_remove(instr);
++      if (slot < 64 && (s->remove & BITFIELD64_BIT(slot))) {
++         if (s->moved & BITFIELD64_BIT(slot)) {
++            nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++            sem.location = s->move_to[slot];
++            sem.num_slots = 1;
++            nir_intrinsic_set_io_semantics(intr, sem);
++            b->cursor = nir_before_instr(instr);
++            nir_src_rewrite(&intr->src[1], nir_imm_int(b, 0));
++         } else {
++            nir_instr_remove(instr);
++         }
++      }
+    }
+ 
+    util_dynarray_fini(&orig);
+@@ -499,9 +511,30 @@ tu_nir_lower_producer_barycentric(nir_shader *producer,
+ 
+    bool ok = true;
+    if (producer->xfb_info) {
++      nir_shader_gather_info(producer, nir_shader_get_entrypoint(producer));
++      uint64_t free_slots = BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32) &
++                            ~(producer->info.outputs_written | s->remove);
++
+       for (unsigned i = 0; i < producer->xfb_info->output_count; i++) {
+-         if (s->remove & BITFIELD64_BIT(producer->xfb_info->outputs[i].location))
++         unsigned loc = producer->xfb_info->outputs[i].location;
++         if (loc >= 64 || !(s->remove & BITFIELD64_BIT(loc)) ||
++             (s->moved & BITFIELD64_BIT(loc)))
++            continue;
++         if (!free_slots) {
+             ok = false;
++            break;
++         }
++         s->move_to[loc] = util_last_bit64(free_slots) - 1;
++         free_slots &= ~BITFIELD64_BIT(s->move_to[loc]);
++         s->moved |= BITFIELD64_BIT(loc);
++      }
++
++      if (ok) {
++         for (unsigned i = 0; i < producer->xfb_info->output_count; i++) {
++            unsigned loc = producer->xfb_info->outputs[i].location;
++            if (loc < 64 && (s->moved & BITFIELD64_BIT(loc)))
++               producer->xfb_info->outputs[i].location = s->move_to[loc];
++         }
+       }
+    }
+ 
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index ad7a6ae01c8..df18dbf2cfa 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -1587,7 +1587,9 @@ tu_hash_shaders(unsigned char *hash,
+                 nir_shader *const *nir,
+                 const struct tu_pipeline_layout *layout,
+                 const struct tu_shader_key *keys,
+-                VkGraphicsPipelineLibraryFlagsEXT state)
++                VkGraphicsPipelineLibraryFlagsEXT state,
++                const struct tu_mesh_shader *mesh,
++                const struct tu_mesh_shader *task)
+ {
+    blake3_hasher ctx;
+ 
+@@ -1601,6 +1603,13 @@ tu_hash_shaders(unsigned char *hash,
+          tu_hash_stage(&ctx, pipeline_flags, stages[i], nir[i], &keys[i]);
+       }
+    }
++   if (mesh->stage_info) {
++      bool mesh_native = TU_EXPERIMENTAL(MESH_NATIVE);
++      _mesa_blake3_update(&ctx, &mesh_native, sizeof(mesh_native));
++      tu_hash_stage(&ctx, pipeline_flags, mesh->stage_info, NULL, &mesh->key);
++   }
++   if (task->stage_info)
++      tu_hash_stage(&ctx, pipeline_flags, task->stage_info, NULL, &task->key);
+    _mesa_blake3_update(&ctx, &state, sizeof(state));
+    enum ir3_shader_debug ir3_debug_key = ir3_shader_debug_hash_key();
+    _mesa_blake3_update(&ctx, &ir3_debug_key, sizeof(ir3_debug_key));
+@@ -1669,7 +1678,7 @@ tu_nir_shaders_destroy(struct vk_device *device,
+       container_of(object, struct tu_nir_shaders, base);
+ 
+    for (unsigned i = 0; i < ARRAY_SIZE(shaders->nir); i++)
+-      ralloc_free(shaders->nir[i]);
++      free(shaders->nir[i].data);
+ 
+    vk_pipeline_cache_object_finish(&shaders->base);
+    vk_free(&device->alloc, shaders);
+@@ -1707,9 +1716,10 @@ tu_nir_shaders_serialize(struct vk_pipeline_cache_object *object,
+       container_of(object, struct tu_nir_shaders, base);
+ 
+    for (unsigned i = 0; i < ARRAY_SIZE(shaders->nir); i++) {
+-      if (shaders->nir[i]) {
++      if (shaders->nir[i].data) {
+          blob_write_uint8(blob, 1);
+-         nir_serialize(blob, shaders->nir[i], true);
++         blob_write_uint64(blob, shaders->nir[i].size);
++         blob_write_bytes(blob, shaders->nir[i].data, shaders->nir[i].size);
+       } else {
+          blob_write_uint8(blob, 0);
+       }
+@@ -1734,8 +1744,19 @@ tu_nir_shaders_deserialize(struct vk_pipeline_cache *cache,
+ 
+    for (unsigned i = 0; i < ARRAY_SIZE(shaders->nir); i++) {
+       if (blob_read_uint8(blob)) {
+-         shaders->nir[i] =
+-            nir_deserialize(NULL, ir3_get_compiler_options(dev->compiler), blob);
++         size_t size = blob_read_uint64(blob);
++         const void *data = blob_read_bytes(blob, size);
++         if (blob->overrun) {
++            vk_pipeline_cache_object_unref(&dev->vk, &shaders->base);
++            return NULL;
++         }
++         shaders->nir[i].data = malloc(size);
++         if (!shaders->nir[i].data) {
++            vk_pipeline_cache_object_unref(&dev->vk, &shaders->base);
++            return NULL;
++         }
++         memcpy(shaders->nir[i].data, data, size);
++         shaders->nir[i].size = size;
+       }
+    }
+ 
+@@ -1765,6 +1786,33 @@ tu_nir_cache_insert(struct vk_pipeline_cache *cache,
+    return container_of(object, struct tu_nir_shaders, base);
+ }
+ 
++static bool
++tu_nir_shaders_set(struct tu_nir_shaders *shaders, mesa_shader_stage stage,
++                   nir_shader *nir)
++{
++   struct blob blob;
++   blob_init(&blob);
++   nir_serialize(&blob, nir, false);
++   ralloc_free(nir);
++   if (blob.out_of_memory) {
++      blob_finish(&blob);
++      return false;
++   }
++   blob_finish_get_buffer(&blob, &shaders->nir[stage].data,
++                          &shaders->nir[stage].size);
++   return true;
++}
++
++static nir_shader *
++tu_nir_shaders_get(struct tu_device *dev, const struct tu_nir_shaders *shaders,
++                   mesa_shader_stage stage, void *mem_ctx)
++{
++   struct blob_reader blob;
++   blob_reader_init(&blob, shaders->nir[stage].data, shaders->nir[stage].size);
++   return nir_deserialize(mem_ctx, ir3_get_compiler_options(dev->compiler),
++                          &blob);
++}
++
+ static void
+ tu_graphics_shader_key_init(struct tu_pipeline_builder *builder,
+                             struct tu_shader_key *key,
+@@ -1802,7 +1850,7 @@ tu_graphics_shader_key_init(struct tu_pipeline_builder *builder,
+ static VkResult
+ tu_link_bary_producer(struct tu_pipeline_builder *builder,
+                       struct tu_shader **shaders,
+-                      nir_shader **post_link_nir,
++                      struct tu_nir_shaders *const *retained,
+                       const struct tu_shader_key *keys_in,
+                       const struct tu_mesh_layout *mesh_layout)
+ {
+@@ -1825,35 +1873,6 @@ tu_link_bary_producer(struct tu_pipeline_builder *builder,
+        !memcmp(&shaders[producer]->bary, &fs->bary, sizeof(fs->bary)))
+       return VK_SUCCESS;
+ 
+-   nir_shader *nir[MESA_SHADER_STAGES] = { NULL };
+-   struct tu_shader *variants[MESA_SHADER_STAGES] = { NULL };
+-   VkPipelineCreationFeedback feedbacks[MESA_SHADER_STAGES] = { 0 };
+-   const VkPipelineShaderStageCreateInfo *stage_infos[MESA_SHADER_STAGES] = { NULL };
+-
+-   for (int i = MESA_SHADER_VERTEX; i <= MESA_SHADER_FRAGMENT; i++) {
+-      if (i == MESA_SHADER_VERTEX && producer == i && mesh_layout) {
+-         nir[i] = mesh_layout->native ?
+-            tu_nir_build_mesh_native_vs(builder->device, mesh_layout) :
+-            tu_nir_build_mesh_vs(builder->device, mesh_layout);
+-         ralloc_steal(builder->mem_ctx, nir[i]);
+-         keys[i].native_mesh_vs = mesh_layout->native;
+-         continue;
+-      }
+-
+-      if (!post_link_nir[i]) {
+-         if (i == producer || i == MESA_SHADER_FRAGMENT) {
+-            mesa_loge("fragment shader barycentrics need the pipeline "
+-                      "libraries to retain their shaders");
+-            return VK_ERROR_UNKNOWN;
+-         }
+-         continue;
+-      }
+-
+-      nir[i] = nir_shader_clone(builder->mem_ctx, post_link_nir[i]);
+-      if (i != producer)
+-         variants[i] = shaders[i];
+-   }
+-
+    blake3_hasher ctx;
+    unsigned char blake3[BLAKE3_KEY_LEN];
+    _mesa_blake3_init(&ctx);
+@@ -1869,12 +1888,41 @@ tu_link_bary_producer(struct tu_pipeline_builder *builder,
+    shader_blake3[BLAKE3_KEY_LEN] = static_cast<unsigned char>(producer);
+ 
+    bool hit;
+-   struct tu_shader *variant = mesh_layout ? NULL :
++   struct tu_shader *variant =
+       tu_pipeline_cache_lookup(builder->cache, shader_blake3,
+                                sizeof(shader_blake3), &hit);
+-   if (variant) {
+-      variants[producer] = variant;
+-   } else {
++   if (!variant) {
++      nir_shader *nir[MESA_SHADER_STAGES] = { NULL };
++      struct tu_shader *variants[MESA_SHADER_STAGES] = { NULL };
++      VkPipelineCreationFeedback feedbacks[MESA_SHADER_STAGES] = { 0 };
++      const VkPipelineShaderStageCreateInfo *stage_infos[MESA_SHADER_STAGES] = { NULL };
++
++      for (int i = MESA_SHADER_VERTEX; i <= MESA_SHADER_FRAGMENT; i++) {
++         if (i == MESA_SHADER_VERTEX && producer == i && mesh_layout) {
++            nir[i] = mesh_layout->native ?
++               tu_nir_build_mesh_native_vs(builder->device, mesh_layout) :
++               tu_nir_build_mesh_vs(builder->device, mesh_layout);
++            ralloc_steal(builder->mem_ctx, nir[i]);
++            keys[i].native_mesh_vs = mesh_layout->native;
++            continue;
++         }
++
++         if (!retained[i]) {
++            if (i == producer || i == MESA_SHADER_FRAGMENT) {
++               mesa_loge("fragment shader barycentrics need the pipeline "
++                         "libraries to retain their shaders");
++               return VK_ERROR_UNKNOWN;
++            }
++            continue;
++         }
++
++         nir[i] = tu_nir_shaders_get(builder->device, retained[i],
++                                     static_cast<mesa_shader_stage>(i),
++                                     builder->mem_ctx);
++         if (i != producer)
++            variants[i] = shaders[i];
++      }
++
+       VkResult result =
+          tu_compile_shaders(builder->device, builder->create_flags,
+                             stage_infos, nir, keys, &builder->layout, blake3,
+@@ -1882,19 +1930,18 @@ tu_link_bary_producer(struct tu_pipeline_builder *builder,
+       if (result != VK_SUCCESS)
+          return result;
+ 
+-      if (memcmp(&variants[producer]->bary, &fs->bary, sizeof(fs->bary))) {
++      variant = variants[producer];
++      if (memcmp(&variant->bary, &fs->bary, sizeof(fs->bary))) {
+          mesa_loge("fragment shader barycentrics: producer request mismatch");
+-         tu_shader_destroy(builder->device, variants[producer]);
++         tu_shader_destroy(builder->device, variant);
+          return VK_ERROR_UNKNOWN;
+       }
+ 
+-      if (!mesh_layout)
+-         variants[producer] =
+-            tu_pipeline_cache_insert(builder->cache, variants[producer]);
++      variant = tu_pipeline_cache_insert(builder->cache, variant);
+    }
+ 
+    vk_pipeline_cache_object_unref(&builder->device->vk, &shaders[producer]->base);
+-   shaders[producer] = variants[producer];
++   shaders[producer] = variant;
+    return VK_SUCCESS;
+ }
+ 
+@@ -1948,7 +1995,9 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+    if (task.stage_info && !mesh.stage_info)
+       return vk_error(builder->device, VK_ERROR_UNKNOWN);
+ 
+-   if (TU_EXPERIMENTAL(BARYCENTRIC) && !contains_all_shader_state(builder->state))
++   if (TU_EXPERIMENTAL(BARYCENTRIC) &&
++       builder->device->vk.enabled_features.fragmentShaderBarycentric &&
++       !contains_all_shader_state(builder->state))
+       retain_nir = true;
+ 
+    if (mesh.stage_info)
+@@ -1958,6 +2007,7 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+    nir_shader *nir[ARRAY_SIZE(stage_infos)] = { NULL };
+    struct tu_shader *shaders[ARRAY_SIZE(stage_infos)] = { NULL };
+    nir_shader *post_link_nir[ARRAY_SIZE(nir)] = { NULL };
++   struct tu_nir_shaders *retained[ARRAY_SIZE(nir)] = { NULL };
+    char *nir_initial_disasm[ARRAY_SIZE(stage_infos)] = { NULL };
+    bool cache_hit = false;
+ 
+@@ -2044,8 +2094,10 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+          for (unsigned j = 0; j < ARRAY_SIZE(library->shaders); j++) {
+             if (library->shaders[j].nir) {
+                assert(!nir[j]);
+-               nir[j] = nir_shader_clone(builder->mem_ctx,
+-                     library->shaders[j].nir);
++               nir[j] = tu_nir_shaders_get(builder->device,
++                                           library->shaders[j].nir,
++                                           static_cast<mesa_shader_stage>(j),
++                                           builder->mem_ctx);
+                keys[j] = library->shaders[j].key;
+                must_compile = true;
+             }
+@@ -2122,7 +2174,7 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+ 
+    unsigned char pipeline_blake3[BLAKE3_KEY_LEN];
+    tu_hash_shaders(pipeline_blake3, builder->create_flags, stage_infos, nir,
+-                   &builder->layout, keys, builder->state);
++                   &builder->layout, keys, builder->state, &mesh, &task);
+ 
+    unsigned char nir_blake3[BLAKE3_KEY_LEN + 1];
+    memcpy(nir_blake3, pipeline_blake3, sizeof(pipeline_blake3));
+@@ -2179,6 +2231,15 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+          return VK_PIPELINE_COMPILE_REQUIRED;
+       }
+ 
++      for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
++           stage < ARRAY_SIZE(shaders); stage = static_cast<mesa_shader_stage>(stage + 1)) {
++         if (shaders[stage]) {
++            vk_pipeline_cache_object_unref(&builder->device->vk,
++                                           &shaders[stage]->base);
++            shaders[stage] = NULL;
++         }
++      }
++
+       result = tu_compile_shaders(builder->device,
+                                   builder->create_flags,
+                                   stage_infos,
+@@ -2205,7 +2266,10 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+             if (!post_link_nir[stage])
+                continue;
+ 
+-            nir_shaders->nir[stage] = post_link_nir[stage];
++            if (!tu_nir_shaders_set(nir_shaders, stage, post_link_nir[stage])) {
++               result = VK_ERROR_OUT_OF_HOST_MEMORY;
++               goto fail;
++            }
+          }
+ 
+          nir_shaders = tu_nir_cache_insert(builder->cache, nir_shaders);
+@@ -2265,9 +2329,8 @@ done:
+    if (nir_shaders) {
+       for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+            stage < ARRAY_SIZE(nir); stage = static_cast<mesa_shader_stage>(stage + 1)) {
+-         if (nir_shaders->nir[stage]) {
+-            post_link_nir[stage] = nir_shaders->nir[stage];
+-         }
++         if (nir_shaders->nir[stage].data)
++            retained[stage] = nir_shaders;
+       }
+    }
+ 
+@@ -2280,8 +2343,8 @@ done:
+       for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+            stage < ARRAY_SIZE(library->shaders);
+            stage = static_cast<mesa_shader_stage>(stage + 1)) {
+-         if (!post_link_nir[stage] && library->shaders[stage].nir) {
+-            post_link_nir[stage] = library->shaders[stage].nir;
++         if (!retained[stage] && library->shaders[stage].nir) {
++            retained[stage] = library->shaders[stage].nir;
+             keys[stage] = library->shaders[stage].key;
+          }
+ 
+@@ -2302,8 +2365,8 @@ done:
+       }
+    }
+ 
+-   result = tu_link_bary_producer(builder, shaders, post_link_nir, keys,
+-                               mesh.shader ? &mesh.layout : NULL);
++   result = tu_link_bary_producer(builder, shaders, retained, keys,
++                                  mesh.shader ? &mesh.layout : NULL);
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
+@@ -2316,25 +2379,23 @@ done:
+       }
+    }
+ 
+-   if (pipeline_contains_all_shader_state(pipeline)) {
+-      /* It doesn't make much sense to use RETAIN_LINK_TIME_OPTIMIZATION_INFO
+-       * when compiling all stages, but make sure we don't leak.
+-       */
+-      if (nir_shaders)
+-         vk_pipeline_cache_object_unref(&builder->device->vk,
+-                                        &nir_shaders->base);
+-   } else {
++   if (!pipeline_contains_all_shader_state(pipeline)) {
+       struct tu_graphics_lib_pipeline *library =
+          tu_pipeline_to_graphics_lib(pipeline);
+-      library->nir_shaders = nir_shaders;
+       for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+            stage < ARRAY_SIZE(library->shaders);
+            stage = static_cast<mesa_shader_stage>(stage + 1)) {
+-         library->shaders[stage].nir = post_link_nir[stage];
++         if (retained[stage])
++            vk_pipeline_cache_object_ref(&retained[stage]->base);
++         library->shaders[stage].nir = retained[stage];
+          library->shaders[stage].key = keys[stage];
+       }
+    }
+ 
++   if (nir_shaders)
++      vk_pipeline_cache_object_unref(&builder->device->vk,
++                                     &nir_shaders->base);
++
+    for (mesa_shader_stage stage = MESA_SHADER_VERTEX;
+         stage < ARRAY_SIZE(shaders); stage = static_cast<mesa_shader_stage>(stage + 1)) {
+       pipeline->shaders[stage] = shaders[stage];
+@@ -4735,9 +4796,11 @@ tu_pipeline_finish(struct tu_pipeline *pipeline,
+       struct tu_graphics_lib_pipeline *library =
+          tu_pipeline_to_graphics_lib(pipeline);
+ 
+-      if (library->nir_shaders)
+-         vk_pipeline_cache_object_unref(&dev->vk,
+-                                        &library->nir_shaders->base);
++      for (unsigned i = 0; i < ARRAY_SIZE(library->shaders); i++) {
++         if (library->shaders[i].nir)
++            vk_pipeline_cache_object_unref(&dev->vk,
++                                           &library->shaders[i].nir->base);
++      }
+ 
+       for (unsigned i = 0; i < library->num_sets; i++) {
+          if (library->layouts[i])
+diff --git a/src/freedreno/vulkan/tu_pipeline.h b/src/freedreno/vulkan/tu_pipeline.h
+index 91659e2a708..3101e1df526 100644
+--- a/src/freedreno/vulkan/tu_pipeline.h
++++ b/src/freedreno/vulkan/tu_pipeline.h
+@@ -70,7 +70,10 @@ struct tu_nir_shaders
+    /* This is optional, and is only filled out when a library pipeline is
+     * compiled with RETAIN_LINK_TIME_OPTIMIZATION_INFO.
+     */
+-   nir_shader *nir[MESA_SHADER_STAGES];
++   struct {
++      void *data;
++      size_t size;
++   } nir[MESA_SHADER_STAGES];
+ };
+ 
+ extern const struct vk_pipeline_cache_object_ops tu_nir_shaders_ops;
+@@ -248,9 +251,8 @@ struct tu_graphics_lib_pipeline {
+    /* For vk_graphics_pipeline_state */
+    void *state_data;
+ 
+-   struct tu_nir_shaders *nir_shaders;
+    struct {
+-      nir_shader *nir;
++      struct tu_nir_shaders *nir;
+       struct tu_shader_key key;
+    } shaders[MESA_SHADER_FRAGMENT + 1];
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index a3d4a3fbd73..57637f4b201 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -4368,8 +4368,8 @@ tu_compile_shaders(struct tu_device *device,
+       if (producer) {
+          link_opts(producer, device->compiler);
+          if (!tu_nir_lower_producer_barycentric(producer, &bary_req)) {
+-            mesa_loge("fragment shader barycentrics conflict with transform "
+-                      "feedback outputs");
++            mesa_loge("fragment shader barycentrics need free varying "
++                      "locations for the transform feedback outputs");
+             result = VK_ERROR_UNKNOWN;
+             goto fail;
+          }
+-- 
+2.53.0
+

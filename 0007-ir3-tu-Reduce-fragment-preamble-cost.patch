@@ -1,0 +1,144 @@
+From 4dc816e310e35d8b65f78fa6acf8ac1b0ae36bcf Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Thu, 22 Oct 2026 20:32:42 +0300
+Subject: [PATCH 07/20] ir3, tu: Reduce fragment preamble cost
+
+ - Don't lower immediates to const-file operands inside the preamble.
+   The preamble writes those immediates with stc and then reads them
+   back, which puts an (ss) wait on the per-draw critical path.
+ - Add ir3_shader_options::preamble_min_benefit. Turnip sets it to 16
+   for fragment shaders in pipelines with a mesh stage, including mesh
+   stages that come from a library. Native mesh draws run the FS preamble
+   once per batch, so cheap hoists cost more than they save.
+
+On meshdemo (Adreno 840) this goes from 0.77 to 0.60 ms per frame.
+
+VK-CTS on Adreno 840 (KGSL):
+  dEQP-VK.glsl.operator.*                        3630 pass, 0 fail, 0 not supported
+  dEQP-VK.mesh_shader.ext.{smoke.monolithic,misc,api,builtin,in_out}.*:
+    760 pass, 0 fail, not supported unchanged
+---
+ src/freedreno/ir3/ir3_cp.c               | 18 ++++++++++++++++++
+ src/freedreno/ir3/ir3_nir_opt_preamble.c |  5 +++--
+ src/freedreno/ir3/ir3_shader.h           |  1 +
+ src/freedreno/vulkan/tu_pipeline.cc      |  5 +++++
+ src/freedreno/vulkan/tu_shader.cc        |  1 +
+ src/freedreno/vulkan/tu_shader.h         |  3 ++-
+ 6 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/src/freedreno/ir3/ir3_cp.c b/src/freedreno/ir3/ir3_cp.c
+index 07c7006a3c9..ef3fe702771 100644
+--- a/src/freedreno/ir3/ir3_cp.c
++++ b/src/freedreno/ir3/ir3_cp.c
+@@ -114,6 +114,21 @@ combine_flags(unsigned *dstflags, struct ir3_instruction *src)
+       *dstflags &= ~IR3_REG_SABS;
+ }
+ 
++static bool
++in_preamble(struct ir3_cp_ctx *ctx, struct ir3_block *block)
++{
++   struct ir3_block *main_start = ir3_after_preamble(ctx->shader);
++
++   foreach_block (b, &ctx->shader->block_list) {
++      if (b == main_start)
++         return false;
++      if (b == block)
++         return true;
++   }
++
++   return false;
++}
++
+ /* Tries lowering an immediate register argument to a const buffer access by
+  * adding to the list of immediates to be pushed to the const buffer when
+  * switching to this shader.
+@@ -125,6 +140,9 @@ lower_immed(struct ir3_cp_ctx *ctx, struct ir3_instruction *instr, unsigned n,
+    if (!ctx->lower_imm_to_const)
+       return false;
+ 
++   if (in_preamble(ctx, instr->block))
++      return false;
++
+    if (!(new_flags & IR3_REG_IMMED))
+       return false;
+ 
+diff --git a/src/freedreno/ir3/ir3_nir_opt_preamble.c b/src/freedreno/ir3/ir3_nir_opt_preamble.c
+index 2b74b03daf5..a5864ef4742 100644
+--- a/src/freedreno/ir3/ir3_nir_opt_preamble.c
++++ b/src/freedreno/ir3/ir3_nir_opt_preamble.c
+@@ -228,7 +228,7 @@ rewrite_cost(nir_def *def, const void *data)
+ 
+    /* We always have to expand booleans */
+    if (def->bit_size == 1)
+-      return def->num_components;
++      return v->shader_options.preamble_min_benefit + def->num_components;
+ 
+    bool mov_needed = false;
+    nir_foreach_use (use, def) {
+@@ -264,7 +264,8 @@ rewrite_cost(nir_def *def, const void *data)
+       }
+    }
+ 
+-   return mov_needed ? def->num_components : 0;
++   return v->shader_options.preamble_min_benefit +
++          (mov_needed ? def->num_components : 0);
+ }
+ 
+ static bool
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index 2cf18ed4683..a9eb53e080c 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -623,6 +623,7 @@ struct ir3_shader_options {
+     * anywhere (e.g., as the target of alias.rt).
+     */
+    bool fragdata_dynamic_remap;
++   unsigned preamble_min_benefit;
+ };
+ 
+ struct ir3_shader_output {
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index 8ca30bb8b92..ed5f063c62f 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -2133,6 +2133,11 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+    if (builder->state & VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) {
+       keys[MESA_SHADER_FRAGMENT].multiview_mask =
+          builder->graphics_state.mv->view_mask;
++      keys[MESA_SHADER_FRAGMENT].mesh_pipeline_fs = !!mesh.stage_info;
++      for (unsigned i = 0; i < builder->num_libraries; i++) {
++         keys[MESA_SHADER_FRAGMENT].mesh_pipeline_fs |=
++            !!builder->libraries[i]->base.mesh_shader;
++      }
+       keys[MESA_SHADER_FRAGMENT].fragment_density_map =
+          builder->fragment_density_map;
+       keys[MESA_SHADER_FRAGMENT].fdm_per_layer =
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index a327dca3d44..93ae02ac5e3 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -3954,6 +3954,7 @@ tu_shader_create(struct tu_device *dev,
+       .push_consts_dwords = shader->const_state.push_consts.dwords,
+       .const_allocs = const_allocs,
+       .nir_options = nir_options,
++      .preamble_min_benefit = key->mesh_pipeline_fs ? 16 : 0,
+    };
+ 
+    struct ir3_shader *ir3_shader =
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 8ec79172791..64fd1272724 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -224,7 +224,8 @@ struct tu_shader_key {
+    bool mesh_native : 1;
+    bool native_mesh_vs : 1;
+    bool virtual_subgroup32 : 1;
+-   uint32_t padding : 18;
++   bool mesh_pipeline_fs : 1;
++   uint32_t padding : 17;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 
+-- 
+2.53.0
+

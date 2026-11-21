@@ -1,0 +1,76 @@
+From cead5fda440734fb538e15dda3e4fdb5d7724e03 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sat, 21 Nov 2026 10:16:03 +0200
+Subject: [PATCH 19/20] ir3: use native 64-bit umin/umax atomics on a8xx
+
+The blob emits native 64-bit atomic umin/umax for both shared memory and
+SSBOs, and they give correct results on a8xx, so stop lowering them to a
+cmpxchg loop there. The other 64-bit atomic ops do not work natively
+(add and the bitwise ops are 32-bit or ignored, imin/imax compare
+unsigned), so they stay lowered.
+
+Only a8xx is switched over. a7xx stays on the loop because this was not
+tested there, and global and image 64-bit atomics are left alone for the
+same reason. Teach ir3_validate about the 64-bit B_MIN/B_MAX form.
+---
+ src/freedreno/ir3/ir3_nir.c      | 23 ++++++++++++++++++++++-
+ src/freedreno/ir3/ir3_validate.c |  2 ++
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index 74ef6ebfb4b..1a4aa808674 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1277,6 +1277,25 @@ atomic_supported(const nir_instr * instr, const void * data)
+    return nir_instr_as_intrinsic(instr)->def.bit_size != 64;
+ }
+ 
++/* a8xx has native 64-bit umin/umax for shared memory and SSBOs, like the blob.
++ * The other 64-bit arithmetic atomics give wrong results natively, so keep
++ * lowering them to a cmpxchg loop. Other gens are untested.
++ */
++static bool
++atomic_supported_a8xx(const nir_instr * instr, const void * data)
++{
++   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++
++   if (intr->intrinsic == nir_intrinsic_shared_atomic ||
++       intr->intrinsic == nir_intrinsic_ssbo_atomic) {
++      nir_atomic_op op = nir_intrinsic_atomic_op(intr);
++      if (op == nir_atomic_op_umin || op == nir_atomic_op_umax)
++         return true;
++   }
++
++   return atomic_supported(instr, data);
++}
++
+ /**
+  * Like glsl_get_natural_size_align_bytes, but for ir3 RA, where all <32-bit
+  * components are stored in half regs.
+@@ -1638,7 +1657,9 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
+    }
+ 
+    /* Lower scratch writemasks */
+-   progress |= OPT(s, nir_lower_atomics, atomic_supported);
++   progress |= OPT(s, nir_lower_atomics,
++                   so->compiler->gen >= 8 ? atomic_supported_a8xx
++                                          : atomic_supported);
+ 
+    if (OPT(s, nir_lower_locals_to_regs, 1)) {
+       progress = true;
+diff --git a/src/freedreno/ir3/ir3_validate.c b/src/freedreno/ir3/ir3_validate.c
+index b442040801c..84ffd19b215 100644
+--- a/src/freedreno/ir3/ir3_validate.c
++++ b/src/freedreno/ir3/ir3_validate.c
+@@ -546,6 +546,8 @@ validate_instr(struct ir3_validate_ctx *ctx, struct ir3_instruction *instr)
+          validate_assert(ctx, !(instr->srcs[0]->flags & IR3_REG_HALF));
+          validate_assert(ctx, !(instr->srcs[1]->flags & IR3_REG_HALF));
+          break;
++      case OPC_ATOMIC_B_MIN:
++      case OPC_ATOMIC_B_MAX:
+       case OPC_ATOMIC_B_XCHG:
+          if (instr->cat6.type == TYPE_ATOMIC_U64) {
+             validate_assert(ctx, !(instr->dsts[0]->flags & IR3_REG_HALF));
+-- 
+2.53.0
+

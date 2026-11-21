@@ -1,0 +1,717 @@
+From 38987c5e6513b10af48f930df9f92d87bbb332f0 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Thu, 22 Oct 2026 20:32:20 +0300
+Subject: [PATCH 06/20] tu: Extend the native A8XX mesh path
+
+ - Fragment shaders that read gl_Layer or gl_ViewportIndex: the mesh
+   shader also writes the value into the per-primitive record. Layer and
+   viewport now work for lines too.
+ - 64-bit and matrix per-primitive outputs.
+ - DERIVATIVE_GROUP_QUADS: swizzled quad flattening of the local id.
+   Advertise meshAndTaskShaderDerivatives with the native path.
+ - Prune vertex slots that neither the FS nor the mesh shader reads when
+   there are more than 32.
+ - Read gl_DrawID from SP_SHARED_CONSTANT_GFX[0x47], as the proprietary
+   driver does, instead of a per-draw UBO.
+ - Re-emit compute state only after a native mesh draw in the same command
+   stream, instead of on every dispatch once any mesh pipeline exists.
+ - Don't call nir_opt_varyings_bulk with an empty shader list. This
+   happened when a mesh library link had a cached FS.
+
+VK-CTS on Adreno 840 (KGSL), TU_EXPERIMENTAL=mesh_shader,mesh_native:
+  dEQP-VK.spirv_assembly.instruction.compute.compute_shader_derivatives.mesh.*
+                                                  181 pass, 0 fail, 2 not supported
+  ...compute_shader_derivatives.task.*            181 pass, 0 fail, 2 not supported
+    (all not supported before)
+  dEQP-VK.mesh_shader.ext.api.draw_indirect*      428 pass, 0 fail, 109 not supported
+  dEQP-VK.mesh_shader.ext.in_out.32_bits_only / with_i64: 160 cases now take the
+    native path and pass
+  dEQP-VK.mesh_shader.ext.pipeline.* and smoke.* run to completion in one
+    process (two optimized_lib cases crashed the process before)
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc     |  40 ++--
+ src/freedreno/vulkan/tu_cmd_buffer.h      |   1 +
+ src/freedreno/vulkan/tu_device.cc         |   2 +-
+ src/freedreno/vulkan/tu_device.h          |   1 -
+ src/freedreno/vulkan/tu_nir_lower_mesh.cc | 263 ++++++++++++++++------
+ src/freedreno/vulkan/tu_pipeline.cc       |   1 -
+ src/freedreno/vulkan/tu_shader.cc         |  26 ++-
+ src/freedreno/vulkan/tu_shader.h          |   1 +
+ 8 files changed, 233 insertions(+), 102 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index cef6e4edc20..e392c5772d2 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -6501,6 +6501,7 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+ 
+    for (uint32_t i = 0; i < commandBufferCount; i++) {
+       VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
++      cmd->state.mesh_native_cs_dirty |= secondary->state.mesh_native_cs_dirty;
+ 
+ #ifdef HAVE_PERFETTO
+       /* Propagate viewport/scissor state so that we can emit the correct
+@@ -7952,10 +7953,15 @@ tu7_emit_shared_preamble_consts(
+    const struct tu_push_constant_range *shared_consts,
+    uint32_t *push_constants)
+ {
+-   tu_cs_emit_pkt4(cs, SP_SHARED_CONSTANT_GFX_REG(CHIP, shared_consts->lo_dwords).reg,
+-                   shared_consts->dwords);
+-   tu_cs_emit_array(cs, push_constants + shared_consts->lo_dwords,
+-                    shared_consts->dwords);
++   const uint32_t dwords =
++      MIN2(shared_consts->dwords,
++           MAX_PUSH_CONSTANTS_SIZE / 4 - MIN2(shared_consts->lo_dwords,
++                                              MAX_PUSH_CONSTANTS_SIZE / 4));
++   if (dwords > 0) {
++      tu_cs_emit_pkt4(cs, SP_SHARED_CONSTANT_GFX_REG(CHIP, shared_consts->lo_dwords).reg,
++                      dwords);
++      tu_cs_emit_array(cs, push_constants + shared_consts->lo_dwords, dwords);
++   }
+ }
+ 
+ static uint32_t
+@@ -10166,9 +10172,10 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
+     * could be overwritten by reg stomping in a renderpass or blit.
+     */
+    if (cmd->device->dbg_renderpass_stomp_cs ||
+-       (!mesh && p_atomic_read(&cmd->device->mesh_native_pipelines))) {
++       (!mesh && cmd->state.mesh_native_cs_dirty)) {
+       tu_cs_emit_state_ib(&cmd->cs, shader->state);
+       cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
++      cmd->state.mesh_native_cs_dirty = false;
+    }
+ 
+    /* There appears to be a HW bug where in some rare circumstances it appears
+@@ -10676,6 +10683,8 @@ tu_draw_mesh_native(struct tu_cmd_buffer *cmd, const uint32_t *groups_xyz,
+       guard.map[0] = 1;
+    }
+ 
++   cmd->state.mesh_native_cs_dirty = true;
++
+    for (uint32_t i = 0; i < draw_count; i++) {
+       cmd->state.mesh_ubo = 0;
+       tu6_emit_vs_params(cmd, NULL, i, 0, 0);
+@@ -10697,27 +10706,6 @@ tu_draw_mesh_native(struct tu_cmd_buffer *cmd, const uint32_t *groups_xyz,
+       tu6_emit_descriptor_sets<CHIP>(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      VK_PIPELINE_BIND_POINT_GRAPHICS, cs);
+ 
+-      if (mesh->const_state.mesh_ubo.idx >= 0 ||
+-          (task && task->const_state.mesh_ubo.idx >= 0)) {
+-         struct tu_cs_memory ubo;
+-         tu_cs_set_writeable(&cmd->sub_cs, true);
+-         VkResult result =
+-            tu_cs_alloc(&cmd->sub_cs, TU_MESH_UBO_DWORDS / 4, 4, &ubo);
+-         tu_cs_set_writeable(&cmd->sub_cs, false);
+-         if (result != VK_SUCCESS) {
+-            vk_command_buffer_set_error(&cmd->vk, result);
+-            return;
+-         }
+-         memset(ubo.map, 0, TU_MESH_UBO_DWORDS * 4);
+-         ubo.map[TU_MESH_UBO_DRAW_INDEX] = i;
+-         tu_emit_mesh_ubo(cs, MESA_SHADER_COMPUTE, mesh->const_state.mesh_ubo.idx,
+-                          ubo.iova);
+-         if (task) {
+-            tu_emit_mesh_ubo(cs, MESA_SHADER_COMPUTE,
+-                             task->const_state.mesh_ubo.idx, ubo.iova);
+-         }
+-      }
+-
+       uint32_t *nop_hdr = NULL;
+       if (count_va) {
+          tu_cs_reserve(cs, 8 + 64);
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 83ce994a8f1..6bac976c0b7 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -637,6 +637,7 @@ struct tu_cmd_state
+    bool pipeline_has_tess;
+    bool pipeline_disable_gmem;
+    bool pipeline_mesh_native;
++   bool mesh_native_cs_dirty;
+    bool raster_order_attachment_access;
+    bool raster_order_attachment_access_valid;
+    bool blit_cache_cleaned;
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 1c22c70d0cc..8493bbb22a2 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -1386,7 +1386,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
+    tu_get_physical_device_properties_1_3(pdevice, props);
+ 
+    /* VK_KHR_compute_shader_derivatives */
+-   props->meshAndTaskShaderDerivatives = false;
++   props->meshAndTaskShaderDerivatives = TU_EXPERIMENTAL(MESH_NATIVE);
+ 
+    /* VK_KHR_fragment_shader_barycentric */
+    props->triStripVertexOrderIndependentOfProvokingVertex = false;
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index a6058d00a63..ea183e9b2e4 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -382,7 +382,6 @@ struct tu_device
+    /* Lazily allocated, protected by the device mutex. */
+    struct tu_bo *tess_bo;
+    struct tu_bo *mesh_native_bo;
+-   uint32_t mesh_native_pipelines;
+ 
+    struct ir3_shader_variant *global_shader_variants[GLOBAL_SH_COUNT];
+    struct ir3_shader *global_shaders[GLOBAL_SH_COUNT];
+diff --git a/src/freedreno/vulkan/tu_nir_lower_mesh.cc b/src/freedreno/vulkan/tu_nir_lower_mesh.cc
+index a24645e66a9..6401426ded5 100644
+--- a/src/freedreno/vulkan/tu_nir_lower_mesh.cc
++++ b/src/freedreno/vulkan/tu_nir_lower_mesh.cc
+@@ -57,7 +57,11 @@ native_prim_type_ok(const struct glsl_type *type)
+       return true;
+    }
+ 
+-   return glsl_type_is_vector_or_scalar(type) && glsl_get_bit_size(type) == 32;
++   if (glsl_type_is_matrix(type))
++      return native_prim_type_ok(glsl_get_column_type(type));
++
++   return glsl_type_is_vector_or_scalar(type) && glsl_get_bit_size(type) != 1 &&
++          glsl_get_bit_size(type) != 8;
+ }
+ 
+ static gl_varying_slot
+@@ -67,6 +71,62 @@ prim_vs_location(unsigned slot)
+           (gl_varying_slot)slot;
+ }
+ 
++static bool
++fs_reads_vtx_slot(const nir_shader *fs, unsigned slot)
++{
++   nir_foreach_shader_in_variable (var, fs) {
++      const unsigned n = nir_variable_count_slots(var, fs_input_type(var));
++      if (slot >= var->data.location && slot < var->data.location + n)
++         return true;
++   }
++   return false;
++}
++
++static uint64_t
++vtx_outputs_read_back(const nir_shader *nir)
++{
++   uint64_t mask = 0;
++
++   nir_foreach_function_impl (impl, nir) {
++      nir_foreach_block (block, impl) {
++         nir_foreach_instr (instr, block) {
++            if (instr->type != nir_instr_type_intrinsic)
++               continue;
++            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++            if (intr->intrinsic != nir_intrinsic_load_deref)
++               continue;
++            nir_variable *var =
++               nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
++            if (!var || var->data.mode != nir_var_shader_out ||
++                var->data.per_primitive)
++               continue;
++            const unsigned n =
++               nir_variable_count_slots(var, glsl_get_array_element(var->type));
++            for (unsigned j = 0; j < n && var->data.location + j < 64; j++)
++               mask |= BITFIELD64_BIT(var->data.location + j);
++         }
++      }
++   }
++
++   return mask;
++}
++
++static void
++prune_unread_vtx_slots(struct tu_mesh_layout *layout, const nir_shader *nir,
++                       const nir_shader *fs)
++{
++   const uint64_t read_back = vtx_outputs_read_back(nir);
++   unsigned num = 0;
++
++   for (unsigned i = 0; i < layout->num_vtx_slots; i++) {
++      const unsigned slot = layout->vtx_slots[i];
++      if (slot < VARYING_SLOT_VAR0 || fs_reads_vtx_slot(fs, slot) ||
++          (read_back & BITFIELD64_BIT(slot)))
++         layout->vtx_slots[num++] = slot;
++   }
++   layout->num_vtx_slots = num;
++}
++
+ static void
+ init_layout(struct tu_mesh_layout *layout, const nir_shader *nir)
+ {
+@@ -118,33 +178,12 @@ enum tu_mesh_native_const {
+ };
+ 
+ static bool
+-fs_reads_layer_viewport(nir_shader *fs)
++fs_reads_slot(const nir_shader *fs, unsigned slot)
+ {
+-   nir_foreach_variable_with_modes (var, fs, nir_var_shader_in | nir_var_system_value) {
+-      if (var->data.mode == nir_var_system_value ?
+-             var->data.location == SYSTEM_VALUE_LAYER_ID :
+-             (var->data.location == VARYING_SLOT_LAYER ||
+-              var->data.location == VARYING_SLOT_VIEWPORT))
++   nir_foreach_shader_in_variable (var, fs) {
++      if (var->data.location == slot)
+          return true;
+    }
+-
+-   nir_foreach_function_impl (impl, fs) {
+-      nir_foreach_block (block, impl) {
+-         nir_foreach_instr (instr, block) {
+-            if (instr->type != nir_instr_type_intrinsic)
+-               continue;
+-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+-            if (intr->intrinsic == nir_intrinsic_load_layer_id)
+-               return true;
+-            if ((intr->intrinsic == nir_intrinsic_load_input ||
+-                 intr->intrinsic == nir_intrinsic_load_interpolated_input) &&
+-                (nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_LAYER ||
+-                 nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_VIEWPORT))
+-               return true;
+-         }
+-      }
+-   }
+-
+    return false;
+ }
+ 
+@@ -176,9 +215,6 @@ native_unsupported(const nir_shader *nir, const struct tu_mesh_layout *layout,
+                         VARYING_BIT_VIEWPORT | user_slots))
+       return "per-primitive builtin outputs";
+ 
+-   if (info->derivative_group == DERIVATIVE_GROUP_QUADS)
+-      return "derivative group quads";
+-
+    if (prim_outputs & (VARYING_BIT_PRIMITIVE_ID | user_slots)) {
+       if (!fs)
+          return "per-primitive outputs without a fragment shader";
+@@ -193,10 +229,8 @@ native_unsupported(const nir_shader *nir, const struct tu_mesh_layout *layout,
+       }
+    }
+ 
+-   if (prim_outputs & (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT)) {
+-      if (!fs || fs_reads_layer_viewport(fs) || layout->prim == MESA_PRIM_LINES)
+-         return "gl_Layer / gl_ViewportIndex output";
+-   }
++   if ((prim_outputs & (VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT)) && !fs)
++      return "gl_Layer / gl_ViewportIndex output without a fragment shader";
+ 
+    return NULL;
+ }
+@@ -225,14 +259,24 @@ init_native_layout(struct tu_mesh_layout *layout, nir_shader *fs,
+    layout->vertex_stride = num * 16 + (layout->has_psiz ? 4 : 0);
+    layout->vertices_offset = 0;
+ 
++   if (fs && slot_index(layout->prim_slots, layout->num_prim_slots,
++                        VARYING_SLOT_LAYER) >= 0) {
++      const nir_lower_sysvals_to_varyings_options sysval_opts = {
++         .layer_id = true,
++      };
++      NIR_PASS(_, fs, nir_lower_sysvals_to_varyings, &sysval_opts);
++   }
++
+    unsigned prim_num = 0;
+    for (unsigned i = 0; i < layout->num_prim_slots; i++) {
+-      if (layout->prim_slots[i] == VARYING_SLOT_LAYER)
++      const unsigned slot = layout->prim_slots[i];
++      if (slot == VARYING_SLOT_LAYER)
+          layout->has_layer = true;
+-      else if (layout->prim_slots[i] == VARYING_SLOT_VIEWPORT)
++      else if (slot == VARYING_SLOT_VIEWPORT)
+          layout->has_viewport = true;
+-      else
+-         layout->prim_slots[prim_num++] = layout->prim_slots[i];
++      if ((slot != VARYING_SLOT_LAYER && slot != VARYING_SLOT_VIEWPORT) ||
++          fs_reads_slot(fs, slot))
++         layout->prim_slots[prim_num++] = slot;
+    }
+    layout->num_prim_slots = prim_num;
+    layout->point_list = layout->prim == MESA_PRIM_POINTS &&
+@@ -304,6 +348,8 @@ tu_nir_mesh_layout(nir_shader *nir, struct tu_mesh_layout *layout,
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+    init_layout(layout, nir);
+    layout->task_payload_size = task_payload_size;
++   if (want_native && fs && layout->num_vtx_slots > MAX_VERTEX_ATTRIBS)
++      prune_unread_vtx_slots(layout, nir, fs);
+ 
+    layout->native_reject = want_native ? native_unsupported(nir, layout, fs) :
+       "native mesh shaders disabled or task shader unsupported";
+@@ -365,6 +411,7 @@ struct lower_mesh_state {
+    nir_def *payload_base;
+    struct native_addr prim;
+    struct native_addr cull;
++   uint64_t flat_vtx;
+    nir_def *record;
+    nir_def *view;
+    nir_def *app_wg;
+@@ -527,29 +574,33 @@ lower_native_indices(nir_builder *b, nir_intrinsic_instr *intr,
+          native_stg(b, nir_u2u16(b, nir_channel(b, value, i)), record,
+                     (comp + i) * 2, 0x1, 2);
+       }
+-      if (verts == 2) {
+-         native_stg(b, nir_imm_intN_t(b, 0, 16), record, 4, 0x1, 2);
+-      } else if (!keep_siv) {
+-         native_stg(b, nir_imm_intN_t(b, 0, 16), record, 6, 0x1, 2);
+-      }
++      if (!keep_siv)
++         native_stg(b, nir_imm_intN_t(b, 0, 16), record, verts == 2 ? 4 : 6, 0x1, 2);
+    }
+    nir_instr_remove(&intr->instr);
+    return true;
+ }
+ 
++static struct native_addr
++native_prim_addr(nir_builder *b, struct lower_mesh_state *state, nir_def *prim)
++{
++   return native_addr_at(b, state->prim, prim, state->layout->prim_dwords * 4);
++}
++
+ static bool
+ lower_native_siv(nir_builder *b, nir_intrinsic_instr *intr,
+                  struct lower_mesh_state *state, bool is_store)
+ {
+    const struct tu_mesh_layout *layout = state->layout;
+-   const bool is_layer =
+-      nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_LAYER;
++   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++   const bool is_layer = sem.location == VARYING_SLOT_LAYER;
++   const unsigned siv_offset = layout->verts_per_prim == 2 ? 4 : 6;
+    nir_def *prim = intr->src[is_store ? 1 : 0].ssa;
+    struct native_addr addr =
+       native_addr_at(b, state->idx, prim, native_record_bytes(layout));
+ 
+    if (!is_store) {
+-      nir_def *half = nir_u2u32(b, native_ldg(b, 1, 16, addr, 6, 2));
++      nir_def *half = nir_u2u32(b, native_ldg(b, 1, 16, addr, siv_offset, 2));
+       nir_def_replace(&intr->def,
+                       is_layer ? nir_ushr_imm(b, half, 8) : nir_iand_imm(b, half, 0xff));
+       return true;
+@@ -558,10 +609,17 @@ lower_native_siv(nir_builder *b, nir_intrinsic_instr *intr,
+    nir_def *value = nir_iand_imm(b, intr->src[0].ssa, 0xff);
+    nir_def *half = is_layer ? nir_ishl_imm(b, value, 8) : value;
+    if (layout->has_layer && layout->has_viewport) {
+-      nir_def *old = nir_u2u32(b, native_ldg(b, 1, 16, addr, 6, 2));
++      nir_def *old = nir_u2u32(b, native_ldg(b, 1, 16, addr, siv_offset, 2));
+       half = nir_ior(b, half, nir_iand_imm(b, old, is_layer ? 0xff : 0xff00));
+    }
+-   native_stg(b, nir_u2u16(b, half), addr, 6, 0x1, 2);
++   native_stg(b, nir_u2u16(b, half), addr, siv_offset, 0x1, 2);
++
++   const int i = slot_index(layout->prim_slots, layout->num_prim_slots,
++                            sem.location);
++   if (i >= 0 && layout->prim_comps[i]) {
++      native_stg(b, intr->src[0].ssa, native_prim_addr(b, state, prim),
++                 layout->prim_off[i] * 4, 0x1, 4);
++   }
+    nir_instr_remove(&intr->instr);
+    return true;
+ }
+@@ -595,12 +653,17 @@ lower_native_cull(nir_builder *b, nir_intrinsic_instr *intr,
+ 
+ static void
+ native_store(nir_builder *b, nir_intrinsic_instr *intr, struct native_addr addr,
+-             unsigned imm, unsigned limit, unsigned align_mul)
++             unsigned imm, unsigned limit, unsigned align_mul, bool flat)
+ {
+    const unsigned comp = nir_intrinsic_component(intr);
+    nir_def *value = intr->src[0].ssa;
+    if (value->bit_size == 1)
+       value = nir_b2i32(b, value);
++   else if (value->bit_size == 16 &&
++            (flat || nir_alu_type_get_base_type(nir_intrinsic_src_type(intr)) != nir_type_float))
++      value = nir_u2u32(b, value);
++   else if (value->bit_size == 16)
++      value = nir_f2f32(b, value);
+ 
+    u_foreach_bit (i, nir_intrinsic_write_mask(intr)) {
+       if (comp + i >= limit)
+@@ -612,26 +675,27 @@ native_store(nir_builder *b, nir_intrinsic_instr *intr, struct native_addr addr,
+ 
+ static void
+ native_load(nir_builder *b, nir_intrinsic_instr *intr, const struct native_addr *addr,
+-            unsigned imm, unsigned limit, unsigned align_mul, nir_def **chans)
++            unsigned imm, unsigned limit, unsigned align_mul, bool flat,
++            nir_def **chans)
+ {
+    const unsigned comp = nir_intrinsic_component(intr);
+ 
+    for (unsigned i = 0; i < intr->def.num_components; i++) {
+       if (addr && comp + i < limit) {
+-         chans[i] = native_ldg(b, 1, intr->def.bit_size, *addr,
+-                               imm + (comp + i) * 4, align_mul);
++         const unsigned bit_size = MAX2(intr->def.bit_size, 32);
++         chans[i] = native_ldg(b, 1, bit_size, *addr, imm + (comp + i) * 4,
++                               align_mul);
++         if (intr->def.bit_size == 16 &&
++             (flat || nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) != nir_type_float))
++            chans[i] = nir_u2u16(b, chans[i]);
++         else if (intr->def.bit_size == 16)
++            chans[i] = nir_f2f16(b, chans[i]);
+       } else {
+          chans[i] = nir_imm_zero(b, 1, intr->def.bit_size);
+       }
+    }
+ }
+ 
+-static struct native_addr
+-native_prim_addr(nir_builder *b, struct lower_mesh_state *state, nir_def *prim)
+-{
+-   return native_addr_at(b, state->prim, prim, state->layout->prim_dwords * 4);
+-}
+-
+ static bool
+ lower_native_prim_indirect(nir_builder *b, nir_intrinsic_instr *intr,
+                            struct lower_mesh_state *state, bool is_store)
+@@ -658,12 +722,12 @@ lower_native_prim_indirect(nir_builder *b, nir_intrinsic_instr *intr,
+       if (is_store) {
+          nir_push_if(b, hit);
+          native_store(b, intr, addr, layout->prim_off[i] * 4,
+-                      layout->prim_comps[i], 4);
++                      layout->prim_comps[i], 4, true);
+          nir_pop_if(b, NULL);
+       } else {
+          nir_def *loaded[4];
+          native_load(b, intr, &addr, layout->prim_off[i] * 4,
+-                     layout->prim_comps[i], 4, loaded);
++                     layout->prim_comps[i], 4, true, loaded);
+          for (unsigned c = 0; c < intr->def.num_components; c++)
+             chans[c] = nir_bcsel(b, hit, loaded[c], chans[c]);
+       }
+@@ -753,14 +817,17 @@ lower_native_output(nir_builder *b, nir_intrinsic_instr *intr,
+       }
+    }
+ 
++   const bool flat = is_prim || (sem.location < 64 &&
++                                 (state->flat_vtx & BITFIELD64_BIT(sem.location)));
++
+    if (is_store) {
+       if (have_addr)
+-         native_store(b, intr, addr, imm, limit, align_mul);
++         native_store(b, intr, addr, imm, limit, align_mul, flat);
+       nir_instr_remove(&intr->instr);
+    } else {
+       nir_def *chans[4];
+       native_load(b, intr, have_addr ? &addr : NULL, imm, limit, align_mul,
+-                  chans);
++                  flat, chans);
+       nir_def_replace(&intr->def, nir_vec(b, chans, intr->def.num_components));
+    }
+    return true;
+@@ -783,6 +850,8 @@ lower_mesh_intrinsic(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+       return true;
+    }
+    case nir_intrinsic_load_draw_id:
++      if (state->native)
++         return false;
+       b->cursor = nir_before_instr(&intr->instr);
+       nir_def_replace(&intr->def, ubo32(b, TU_MESH_UBO_DRAW_INDEX));
+       return true;
+@@ -972,10 +1041,38 @@ lower_task_payload_io(nir_shader *nir)
+    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_task_payload, NULL);
+ }
+ 
++struct flatten_state {
++   uint16_t size[3];
++   bool quads;
++};
++
++static nir_def *
++flat_to_local_id(nir_builder *b, nir_def *index, const struct flatten_state *state)
++{
++   const uint16_t *size = state->size;
++
++   if (!state->quads) {
++      return nir_vec3(b, nir_umod_imm(b, index, size[0]),
++                      nir_umod_imm(b, nir_udiv_imm(b, index, size[0]), size[1]),
++                      nir_udiv_imm(b, index, size[0] * size[1]));
++   }
++
++   nir_def *z = nir_udiv_imm(b, index, size[0] * size[1]);
++   nir_def *rest = nir_umod_imm(b, index, size[0] * size[1]);
++   nir_def *quad = nir_ushr_imm(b, rest, 2);
++   nir_def *lane = nir_iand_imm(b, rest, 3);
++   nir_def *x = nir_iadd(b, nir_ishl_imm(b, nir_umod_imm(b, quad, size[0] / 2), 1),
++                         nir_iand_imm(b, lane, 1));
++   nir_def *y = nir_iadd(b, nir_ishl_imm(b, nir_udiv_imm(b, quad, size[0] / 2), 1),
++                         nir_ushr_imm(b, lane, 1));
++   return nir_vec3(b, x, y, z);
++}
++
+ static bool
+ flatten_local_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ {
+-   const uint16_t *size = (const uint16_t *)data;
++   const struct flatten_state *state = (const struct flatten_state *)data;
++   const uint16_t *size = state->size;
+ 
+    if (intr->intrinsic == nir_intrinsic_load_workgroup_size) {
+       b->cursor = nir_before_instr(&intr->instr);
+@@ -985,15 +1082,22 @@ flatten_local_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+       return true;
+    }
+ 
++   if (intr->intrinsic == nir_intrinsic_load_local_invocation_index && state->quads) {
++      b->cursor = nir_before_instr(&intr->instr);
++      nir_def *id = flat_to_local_id(b, nir_load_local_invocation_index(b), state);
++      nir_def *index = nir_iadd(b, nir_channel(b, id, 0),
++                                nir_iadd(b, nir_imul_imm(b, nir_channel(b, id, 1), size[0]),
++                                         nir_imul_imm(b, nir_channel(b, id, 2),
++                                                      size[0] * size[1])));
++      nir_def_replace(&intr->def, nir_u2uN(b, index, intr->def.bit_size));
++      return true;
++   }
++
+    if (intr->intrinsic != nir_intrinsic_load_local_invocation_id)
+       return false;
+ 
+    b->cursor = nir_before_instr(&intr->instr);
+-   nir_def *index = nir_load_local_invocation_index(b);
+-   nir_def *id = nir_vec3(b, nir_umod_imm(b, index, size[0]),
+-                          nir_umod_imm(b, nir_udiv_imm(b, index, size[0]),
+-                                       size[1]),
+-                          nir_udiv_imm(b, index, size[0] * size[1]));
++   nir_def *id = flat_to_local_id(b, nir_load_local_invocation_index(b), state);
+    nir_def_replace(&intr->def, nir_u2uN(b, id, intr->def.bit_size));
+    return true;
+ }
+@@ -1008,11 +1112,16 @@ finish_lowering(nir_shader *nir, struct lower_mesh_state *state)
+             nir_metadata_none, state);
+    uint16_t *size = nir->info.workgroup_size;
+    if (state->native && (size[1] != 1 || size[2] != 1)) {
+-      uint16_t orig[3] = { size[0], size[1], size[2] };
++      struct flatten_state flatten = {
++         .size = { size[0], size[1], size[2] },
++         .quads = nir->info.derivative_group == DERIVATIVE_GROUP_QUADS,
++      };
+       NIR_PASS(_, nir, nir_shader_intrinsics_pass, flatten_local_id,
+-               nir_metadata_none, orig);
+-      size[0] = orig[0] * orig[1] * orig[2];
++               nir_metadata_none, &flatten);
++      size[0] = flatten.size[0] * flatten.size[1] * flatten.size[2];
+       size[1] = size[2] = 1;
++      if (flatten.quads)
++         nir->info.derivative_group = DERIVATIVE_GROUP_LINEAR;
+    }
+    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+    NIR_PASS(_, nir, nir_opt_dce);
+@@ -1173,6 +1282,17 @@ tu_nir_lower_mesh(nir_shader *nir, struct tu_mesh_layout *layout,
+          NIR_PASS(_, nir, nir_fixup_deref_modes);
+    }
+ 
++   uint64_t flat_vtx = 0;
++   nir_foreach_shader_out_variable (var, nir) {
++      if (var->data.per_primitive || var->data.interpolation != INTERP_MODE_FLAT ||
++          var->data.location < VARYING_SLOT_VAR0)
++         continue;
++      const unsigned n =
++         nir_variable_count_slots(var, glsl_get_array_element(var->type));
++      for (unsigned j = 0; j < n && var->data.location + j < 64; j++)
++         flat_vtx |= BITFIELD64_BIT(var->data.location + j);
++   }
++
+    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_out, type_size_vec4,
+             nir_lower_io_lower_64bit_to_32);
+    if (layout->native)
+@@ -1183,7 +1303,7 @@ tu_nir_lower_mesh(nir_shader *nir, struct tu_mesh_layout *layout,
+    nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+    nir_builder b = nir_builder_at(nir_before_impl(impl));
+ 
+-   struct lower_mesh_state state = { .layout = layout };
++   struct lower_mesh_state state = { .layout = layout, .flat_vtx = flat_vtx };
+ 
+    if (layout->native) {
+       nir_loop *view_loop = NULL;
+@@ -1313,8 +1433,7 @@ tu_nir_lower_task(nir_shader *nir, uint32_t *payload_size)
+ bool
+ tu_nir_task_native_supported(const nir_shader *nir, uint32_t payload_size)
+ {
+-   return nir->info.derivative_group != DERIVATIVE_GROUP_QUADS &&
+-          payload_size <= 16384;
++   return payload_size <= 16384;
+ }
+ 
+ static void
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index df18dbf2cfa..8ca30bb8b92 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -4931,7 +4931,6 @@ tu_pipeline_builder_build(struct tu_pipeline_builder *builder,
+             vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
+             return result;
+          }
+-         p_atomic_set(&builder->device->mesh_native_pipelines, 1);
+          struct vk_vertex_input_state *vi = &builder->all_state.vi;
+          *vi = {};
+          vi->bindings_valid = 1;
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 57637f4b201..a327dca3d44 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -775,6 +775,17 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
+          const_allocs->consts[IR3_CONST_ALLOC_PUSH_CONSTS].offset_vec4);
+       return true;
+ 
++   case nir_intrinsic_load_draw_id: {
++      if (b->shader->info.stage != MESA_SHADER_COMPUTE)
++         return false;
++      const uint32_t base =
++         const_allocs->consts[IR3_CONST_ALLOC_PUSH_CONSTS].offset_vec4 * 4 +
++         TU_MESH_NATIVE_SHARED_DRAW_ID - shader->const_state.push_consts.lo_dwords;
++      nir_def_replace(&instr->def,
++                      nir_load_const_ir3(b, 1, 32, nir_imm_int(b, 0), .base = base));
++      return true;
++   }
++
+    case nir_intrinsic_load_vulkan_descriptor:
+       lower_load_vulkan_descriptor(b, instr);
+       return true;
+@@ -1473,6 +1484,12 @@ gather_push_constants(nir_shader *shader, struct tu_shader *tu_shader)
+                continue;
+ 
+             nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
++            if (intrin->intrinsic == nir_intrinsic_load_draw_id &&
++                shader->info.stage == MESA_SHADER_COMPUTE) {
++               min = MIN2(min, TU_MESH_NATIVE_SHARED_DRAW_ID * 4);
++               max = MAX2(max, (TU_MESH_NATIVE_SHARED_DRAW_ID + 1) * 4);
++               continue;
++            }
+             if (intrin->intrinsic != nir_intrinsic_load_push_constant)
+                continue;
+ 
+@@ -1555,7 +1572,11 @@ tu_lower_io(nir_shader *shader, struct tu_device *dev,
+       .type = tu_push_consts_type(layout, dev->compiler),
+    };
+ 
+-   if (const_state->push_consts.type == IR3_PUSH_CONSTS_PER_STAGE) {
++   if (shader->info.stage == MESA_SHADER_COMPUTE &&
++       BITSET_TEST(shader->info.system_values_read, SYSTEM_VALUE_DRAW_ID)) {
++      gather_push_constants(shader, tu_shader);
++      const_state->push_consts.type = IR3_PUSH_CONSTS_SHARED_PREAMBLE;
++   } else if (const_state->push_consts.type == IR3_PUSH_CONSTS_PER_STAGE) {
+       gather_push_constants(shader, tu_shader);
+    } else if (const_state->push_consts.type ==
+             IR3_PUSH_CONSTS_SHARED_PREAMBLE) {
+@@ -4052,6 +4073,9 @@ tu_link_shaders(struct tu_device *dev,
+       }
+    }
+ 
++   if (!link_shaders_count)
++      return;
++
+    nir_opt_varyings_bulk(link_shaders, link_shaders_count, true, UINT32_MAX,
+                          UINT32_MAX, link_opts, dev->compiler);
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 23246311474..8ec79172791 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -61,6 +61,7 @@ struct tu_const_state
+ };
+ 
+ #define TU_MESH_NATIVE_CONSTS_VEC4 5
++#define TU_MESH_NATIVE_SHARED_DRAW_ID 0x47
+ #define TU_MESH_NATIVE_HEADER_DWORDS 26
+ 
+ enum tu_mesh_ubo_dword {
+-- 
+2.53.0
+

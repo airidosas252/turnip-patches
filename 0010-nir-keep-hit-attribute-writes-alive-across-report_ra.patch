@@ -1,0 +1,33 @@
+From 492ba1264b3d79cf1f39d4d9caaa5bb3e000d4df Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sat, 21 Nov 2026 10:15:54 +0200
+Subject: [PATCH 10/20] nir: keep hit attribute writes alive across
+ report_ray_intersection
+
+The any-hit shader that report_ray_intersection runs can read the hit
+attributes, so the dead write elimination must not drop the stores made
+before it.
+---
+ src/compiler/nir/nir_opt_dead_write_vars.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/compiler/nir/nir_opt_dead_write_vars.c b/src/compiler/nir/nir_opt_dead_write_vars.c
+index 1c54818f5db..3a14be2b21d 100644
+--- a/src/compiler/nir/nir_opt_dead_write_vars.c
++++ b/src/compiler/nir/nir_opt_dead_write_vars.c
+@@ -220,6 +220,12 @@ remove_dead_write_vars_local(nir_shader *shader, nir_block *block,
+          break;
+       }
+ 
++      case nir_intrinsic_report_ray_intersection: {
++         /* The any-hit shader can read the hit attributes */
++         clear_unused_for_modes(unused_writes, nir_var_ray_hit_attrib);
++         break;
++      }
++
+       case nir_intrinsic_trace_ray:
+       case nir_intrinsic_rt_trace_ray: {
+          /* Mark payload as it can be used by the callees */
+-- 
+2.53.0
+

@@ -1,0 +1,116 @@
+From d9059343780c8bd706b22e3c2c9d0ffb64a40231 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sat, 21 Nov 2026 10:15:54 +0200
+Subject: [PATCH 13/20] tu: add TU_DBG_BOLOG and TU_DBG_AS_LOG debug logging
+
+TU_DBG_BOLOG=<dir> writes the iova range of every mapped and unmapped BO
+with a timestamp to <dir>/bolog-<pid>.log, to match against GPU faults in
+the kernel log. TU_DBG_AS_LOG=1 logs acceleration structure builds.
+Debug aids, not meant for upstream.
+---
+ .../vulkan/tu_acceleration_structure.cc       | 16 +++++++++
+ src/freedreno/vulkan/tu_knl_drm_msm.cc        | 33 +++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/src/freedreno/vulkan/tu_acceleration_structure.cc b/src/freedreno/vulkan/tu_acceleration_structure.cc
+index 6979f906a5b..4087e31f886 100644
+--- a/src/freedreno/vulkan/tu_acceleration_structure.cc
++++ b/src/freedreno/vulkan/tu_acceleration_structure.cc
+@@ -330,6 +330,22 @@ tu_CmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t inf
+    struct tu_device *device = cmd->device;
+    struct tu_saved_compute_state state;
+ 
++   /* DEBUG: TU_DBG_AS_LOG=1 logs the builds: type, mode, geometries, primitives. */
++   if (debug_get_bool_option("TU_DBG_AS_LOG", false)) {
++      for (uint32_t i = 0; i < infoCount; i++) {
++         uint64_t prims = 0;
++         for (uint32_t g = 0; g < pInfos[i].geometryCount; g++)
++            prims += ppBuildRangeInfos[i][g].primitiveCount;
++         struct timespec ts;
++         clock_gettime(CLOCK_REALTIME, &ts);
++         mesa_logi("ASLOG %ld.%03ld %s %s geoms %u prims %" PRIu64 " flags 0x%x",
++                   (long)ts.tv_sec, ts.tv_nsec / 1000000,
++                   pInfos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR ? "tlas" : "blas",
++                   pInfos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR ? "update" : "build",
++                   pInfos[i].geometryCount, prims, pInfos[i].flags);
++      }
++   }
++
+    tu_save_compute_state(cmd, &state);
+ 
+    struct vk_acceleration_structure_build_args args = {
+diff --git a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+index 2f511f65aac..db4f8f000e5 100644
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -468,6 +468,34 @@ tu_map_vm_bind(struct tu_device *dev, uint32_t map_op, uint32_t map_op_flags,
+    return VK_SUCCESS;
+ }
+ 
++/* DEBUG: TU_DBG_BOLOG=<dir> logs the iova ranges of the BOs as they are mapped
++ * and unmapped, with the wall clock time, to <dir>/bolog-<pid>.log, to match GPU
++ * faults in the kernel log.
++ */
++static void
++tu_dbg_bolog(const char *what, uint64_t iova, uint64_t size, const char *name)
++{
++   static FILE *f;
++   static bool init;
++   if (!init) {
++      init = true;
++      const char *dir = getenv("TU_DBG_BOLOG");
++      if (dir) {
++         char path[512];
++         snprintf(path, sizeof(path), "%s/bolog-%d.log", dir, (int)getpid());
++         f = fopen(path, "a");
++         if (f)
++            setvbuf(f, NULL, _IOLBF, 0);
++      }
++   }
++   if (!f)
++      return;
++   struct timespec ts;
++   clock_gettime(CLOCK_REALTIME, &ts);
++   fprintf(f, "%ld.%06ld %s %" PRIx64 " +%" PRIx64 " %s\n", (long)ts.tv_sec,
++           ts.tv_nsec / 1000, what, iova, size, name ? name : "");
++}
++
+ static VkResult
+ msm_allocate_vm_bind(struct tu_device *dev,
+                      uint32_t gem_handle,
+@@ -712,6 +740,8 @@ msm_bo_init(struct tu_device *dev,
+ 
+    /* We don't use bo->name here because for the !TU_DEBUG=bo case bo->name is NULL. */
+    msm_common_bo_set_name(dev->fd, bo->gem_handle, name, strlen(name));
++   if (result == VK_SUCCESS)
++      tu_dbg_bolog("map", bo->iova, bo->size, name);
+ 
+    if (result == VK_SUCCESS &&
+        (mem_property & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) &&
+@@ -890,6 +920,7 @@ msm_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ 
+    if (dev->physical_device->has_vm_bind) {
+       if (!bo->lazy) {
++         tu_dbg_bolog("unmap", bo->iova, bo->size, NULL);
+          tu_map_vm_bind(dev, MSM_VM_BIND_OP_UNMAP, 0, bo->iova, 0, 0,
+                         bo->size);
+          tu_free_iova(dev, bo->iova, bo->size);
+@@ -929,6 +960,7 @@ msm_sparse_vma_init(struct tu_device *dev,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   tu_dbg_bolog("sparse-vma", out_vma->msm.iova, size, NULL);
+    if (flags & TU_SPARSE_VMA_MAP_ZERO) {
+       assert(dev->physical_device->has_vm_bind);
+       result = tu_map_vm_bind(dev, MSM_VM_BIND_OP_MAP_NULL, 0,
+@@ -945,6 +977,7 @@ msm_sparse_vma_finish(struct tu_device *dev,
+                       struct tu_sparse_vma *vma)
+ {
+    if (dev->physical_device->has_vm_bind) {
++      tu_dbg_bolog("sparse-vma-unmap", vma->msm.iova, vma->msm.size, NULL);
+       tu_map_vm_bind(dev, MSM_VM_BIND_OP_UNMAP, 0, vma->msm.iova, 0, 0,
+                      vma->msm.size);
+    }
+-- 
+2.53.0
+

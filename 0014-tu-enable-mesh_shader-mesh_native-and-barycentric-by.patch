@@ -1,0 +1,29 @@
+From d232a893d95b492c0da299cfbe8d01c1c652e8a7 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sat, 21 Nov 2026 10:15:55 +0200
+Subject: [PATCH 14/20] tu: enable mesh_shader, mesh_native and barycentric by
+ default
+
+TU_EXPERIMENTAL now defaults to these three when it is not set, so setting
+it replaces the list. Local hack, not meant for upstream.
+---
+ src/freedreno/vulkan/tu_util.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index 00bfe14c9bf..c7c3dfbcf85 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -139,7 +139,8 @@ static void
+ tu_env_init_once(void)
+ {
+    tu_env.start_debug = tu_env.debug = parse_debug_string(os_get_option("TU_DEBUG"), tu_debug_options);
+-   tu_env.experimental = parse_debug_string(os_get_option("TU_EXPERIMENTAL"), tu_experimental_options);
++   const char *experimental = os_get_option("TU_EXPERIMENTAL");
++   tu_env.experimental = parse_debug_string(experimental ? experimental : "mesh_shader,mesh_native,barycentric", tu_experimental_options);
+ 
+    if (TU_DEBUG(STARTUP))
+       mesa_logi("TU_DEBUG=0x%" PRIx64, tu_env.debug.load());
+-- 
+2.53.0
+

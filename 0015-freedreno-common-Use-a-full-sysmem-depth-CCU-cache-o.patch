@@ -1,0 +1,57 @@
+From 23e62bb86e96b4aa855687a41c03255f26e540d3 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 25 Oct 2026 08:32:48 +0200
+Subject: [PATCH 15/20] freedreno/common: Use a full sysmem depth CCU cache on
+ X2-90
+
+X2-90 inherits the a8xx_gen2 sysmem depth CCU setting, DEPTH_CACHE_SIZE
+THREE_QUARTER with 192KB per CCU. With it, sysmem render passes that
+write UBWC depth and stencil can deadlock the GPU. Cyberpunk 2077 under
+vkd3d-proton hangs within minutes (CP BR status 0x00fc1346, followed by
+a hangcheck recovery loop) and shows blocky corruption before that.
+
+A captured submit reproduces the hang every time when replayed. It
+reduces to two draws in a depth-only sysmem pass: a discarding fragment
+shader, D32_SFLOAT UBWC depth with separate stencil, depth test and
+write, and stencil REPLACE. Changing only RB_CCU_CACHE_CNTL in the
+replay:
+- DEPTH_CACHE_SIZE 3 hangs at every depth and color cache offset
+  tried, including layouts with extra space between the two caches;
+- FULL, HALF and QUARTER do not hang.
+
+Programming the A840 values of RB_CCU_CNTL, RB_CCU_DBG_ECO_CNTL and
+RB_RBP_CNTL from the kernel does not avoid the hang either.
+
+Use the full 256KB per CCU depth cache from gen1, which is also the
+gen2 GMEM depth setting. With 21MB of GMEM and 8 CCUs the sysmem
+caches still fit, and the depth cache moves from 0x10c0000 to
+0x1040000. This fixes the hangs and the corruption in the game.
+
+X2-85 also uses a8xx_gen2 but was not tested, so it is left unchanged.
+
+Fixes: 6e3598177b8 ("freedreno/common: Add A840 and X2-85")
+---
+ src/freedreno/common/freedreno_devices.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/common/freedreno_devices.py b/src/freedreno/common/freedreno_devices.py
+index 7320f6cae01..2cbb1503726 100644
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -1616,7 +1616,12 @@ add_gpus([
+         GPUId(chip_id=0xffff44070041, name="Adreno (TM) X2-90"),
+     ], A6xxGPUInfo(
+         CHIP.A8XX,
+-        [a7xx_base, a7xx_gen3, a8xx_base, a8xx_gen2, a8xx_vpc_cache_lg],
++        [a7xx_base, a7xx_gen3, a8xx_base, a8xx_gen2, a8xx_vpc_cache_lg,
++         # A THREE_QUARTER sysmem depth cache can hang the GPU on X2-90
++         GPUProps(
++            sysmem_ccu_depth_cache_fraction = CCUColorCacheFraction.FULL.value,
++            sysmem_per_ccu_depth_cache_size = 256 * 1024,
++         )],
+         num_ccu = 8,
+         num_slices = 4,
+         tile_align_w = 64,
+-- 
+2.53.0
+

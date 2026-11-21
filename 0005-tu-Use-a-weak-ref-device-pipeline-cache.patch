@@ -1,0 +1,36 @@
+From 44f6f9560fdeec21bc16469e60e30703c869662a Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Thu, 22 Oct 2026 20:30:08 +0300
+Subject: [PATCH 05/20] tu: Use a weak-ref device pipeline cache
+
+Let the internal pipeline cache drop objects once no pipeline references
+them, like RADV and ANV. Previously every shader created without an
+application cache stayed alive for the lifetime of the device.
+
+VK-CTS on Adreno 840 (KGSL):
+  dEQP-VK.fragment_shading_barycentric.pipeline_library.*  5521 / 0 / 1476,
+    single process, peak RSS 120 MB (371 MB without weak_ref)
+  dEQP-VK.pipeline.monolithic.cache.*                       773 / 0 / 1
+  dEQP-VK.pipeline.monolithic.creation_feedback.*            13 / 0 / 0
+  dEQP-VK.pipeline.pipeline_library.creation_feedback.*      10 / 0 / 0
+  dEQP-VK.pipeline.pipeline_library.graphics_library.*      812 / 20 / 4 (unchanged)
+---
+ src/freedreno/vulkan/tu_device.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 70ba88d447c..1c22c70d0cc 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3056,7 +3056,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    struct tu6_global *global = NULL;
+    uint32_t global_size = sizeof(struct tu6_global);
+-   struct vk_pipeline_cache_create_info pcc_info = { };
++   struct vk_pipeline_cache_create_info pcc_info = { .weak_ref = true };
+ 
+    for (unsigned i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+       const VkDeviceQueueCreateInfo *queue_create =
+-- 
+2.53.0
+

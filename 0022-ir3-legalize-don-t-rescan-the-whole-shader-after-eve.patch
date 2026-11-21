@@ -1,0 +1,207 @@
+From 35bcb50b7f406370fdce56e1fe93f0e3409fe307 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sat, 21 Nov 2026 17:23:51 +0200
+Subject: [PATCH 22/23] ir3/legalize: don't rescan the whole shader after every
+ jump change
+
+opt_jump started over from the first block after every change and
+after every removed block. Ray tracing shaders with ~20k blocks needed
+over 4000 passes, which took 30-95 s. Blocks before the earliest block
+whose successors, instructions or next block changed (or that jumps to
+such a block) can't change on the next pass, so start there instead.
+The changes are made in the same order, so the result is unchanged.
+---
+ src/freedreno/ir3/ir3_legalize.c | 148 +++++++++++++++++++++----------
+ 1 file changed, 102 insertions(+), 46 deletions(-)
+
+diff --git a/src/freedreno/ir3/ir3_legalize.c b/src/freedreno/ir3/ir3_legalize.c
+index 8e8fe5e339d..e55ac5f7c2e 100644
+--- a/src/freedreno/ir3/ir3_legalize.c
++++ b/src/freedreno/ir3/ir3_legalize.c
+@@ -1139,71 +1139,129 @@ is_invertible_branch(struct ir3_instruction *instr)
+    }
+ }
+ 
++/* Remember the earliest block at or before the current one that has to be
++ * looked at again. Blocks after the current one are reached anyway.
++ */
++static void
++opt_jump_mark(struct ir3_block **restart, struct ir3_block *cur,
++              struct ir3_block *block)
++{
++   if (block && block->index <= cur->index &&
++       (!*restart || block->index < (*restart)->index))
++      *restart = block;
++}
++
++/* A block whose instructions or successors changed may now resolve to
++ * something else, so it and the blocks jumping to it need another look.
++ */
++static void
++opt_jump_mark_changed(struct ir3_block **restart, struct ir3_block *cur,
++                      struct ir3_block *block)
++{
++   opt_jump_mark(restart, cur, block);
++   for (unsigned i = 0; i < block->predecessors_count; i++)
++      opt_jump_mark(restart, cur, block->predecessors[i]);
++}
++
++static struct ir3_block *
++opt_jump_block_before(struct ir3 *ir, struct ir3_block *block)
++{
++   if (block->node.prev == &ir->block_list)
++      return NULL;
++   return list_entry(block->node.prev, struct ir3_block, node);
++}
++
++/* Optimize jumps until nothing changes. This used to restart from the first
++ * block after every change, which is quadratic on shaders with thousands of
++ * blocks. Blocks before the restart point would not change on such a pass,
++ * so restart from the earliest block that may change instead, which gives
++ * the same result in the same order.
++ */
+ static bool
+ opt_jump(struct ir3 *ir)
+ {
+    bool progress = false;
+ 
+    unsigned index = 0;
+-   foreach_block (block, &ir->block_list)
++   foreach_block (block, &ir->block_list) {
+       block->index = index++;
+ 
+-   foreach_block (block, &ir->block_list) {
+       /* This pass destroys the physical CFG so don't keep it around to avoid
+        * validation errors.
+        */
+       block->physical_successors_count = 0;
+       block->physical_predecessors_count = 0;
++   }
+ 
+-      foreach_instr (instr, &block->instr_list) {
+-         if (!is_flow(instr) || !instr->cat0.target)
+-            continue;
++   struct ir3_block *start =
++      list_first_entry(&ir->block_list, struct ir3_block, node);
++   while (start) {
++      struct ir3_block *restart = NULL;
+ 
+-         struct ir3_block *tblock = resolve_dest_block(instr->cat0.target);
+-         if (tblock != instr->cat0.target) {
+-            progress = true;
++      foreach_block_from (block, &ir->block_list, &start->node) {
++         foreach_instr (instr, &block->instr_list) {
++            if (!is_flow(instr) || !instr->cat0.target)
++               continue;
+ 
+-            /* Exit early if we deleted a block to avoid iterator
+-             * weirdness/assert fails
+-             */
+-            if (retarget_jump(instr, tblock))
+-               return true;
++            struct ir3_block *old_target = instr->cat0.target;
++            struct ir3_block *tblock = resolve_dest_block(old_target);
++            if (tblock != old_target) {
++               progress = true;
++               opt_jump_mark_changed(&restart, block, block);
++
++               struct ir3_block *before = opt_jump_block_before(ir, old_target);
++               struct ir3_block *after =
++                  list_entry(old_target->node.next, struct ir3_block, node);
++               if (retarget_jump(instr, tblock)) {
++                  /* The old target was removed, so the block before it has a
++                   * new next block. Stop here like a restart would.
++                   */
++                  opt_jump_mark(&restart, block, before);
++                  if (restart == old_target)
++                     restart = after;
++                  goto next_pass;
++               }
++            }
+          }
+-      }
+ 
+-      /* Detect the case where the block ends either with:
+-       * - A single unconditional jump to the next block.
+-       * - Two jump instructions with opposite conditions, and one of the
+-       *   them jumps to the next block.
+-       * We can remove the one that jumps to the next block in either case.
+-       */
+-      if (list_is_empty(&block->instr_list))
+-         continue;
+-
+-      struct ir3_instruction *jumps[2] = {NULL, NULL};
+-      jumps[0] =
+-         list_last_entry(&block->instr_list, struct ir3_instruction, node);
+-      if (!list_is_singular(&block->instr_list))
+-         jumps[1] =
+-            list_last_entry(&jumps[0]->node, struct ir3_instruction, node);
+-
+-      if (jumps[0]->opc == OPC_JUMP)
+-         jumps[1] = NULL;
+-      else if (!is_invertible_branch(jumps[0]) || !jumps[1] ||
+-               !is_invertible_branch(jumps[1])) {
+-         continue;
+-      }
++         /* Detect the case where the block ends either with:
++          * - A single unconditional jump to the next block.
++          * - Two jump instructions with opposite conditions, and one of the
++          *   them jumps to the next block.
++          * We can remove the one that jumps to the next block in either case.
++          */
++         if (list_is_empty(&block->instr_list))
++            continue;
+ 
+-      for (unsigned i = 0; i < 2; i++) {
+-         if (!jumps[i])
++         struct ir3_instruction *jumps[2] = {NULL, NULL};
++         jumps[0] =
++            list_last_entry(&block->instr_list, struct ir3_instruction, node);
++         if (!list_is_singular(&block->instr_list))
++            jumps[1] =
++               list_last_entry(&jumps[0]->node, struct ir3_instruction, node);
++
++         if (jumps[0]->opc == OPC_JUMP)
++            jumps[1] = NULL;
++         else if (!is_invertible_branch(jumps[0]) || !jumps[1] ||
++                  !is_invertible_branch(jumps[1])) {
+             continue;
+-         struct ir3_block *tblock = jumps[i]->cat0.target;
+-         if (&tblock->node == block->node.next) {
+-            list_delinit(&jumps[i]->node);
+-            progress = true;
+-            break;
++         }
++
++         for (unsigned i = 0; i < 2; i++) {
++            if (!jumps[i])
++               continue;
++            struct ir3_block *tblock = jumps[i]->cat0.target;
++            if (&tblock->node == block->node.next) {
++               list_delinit(&jumps[i]->node);
++               progress = true;
++               opt_jump_mark_changed(&restart, block, block);
++               break;
++            }
+          }
+       }
++
++   next_pass:
++      start = restart;
+    }
+ 
+    return progress;
+@@ -2618,9 +2676,7 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary,
+       progress |= apply_fine_deriv_macro(ctx, block);
+    }
+ 
+-   bool cfg_changed = false;
+-   while (opt_jump(ir))
+-      cfg_changed = true;
++   bool cfg_changed = opt_jump(ir);
+ 
+    prede_sched(ir);
+ 
+-- 
+2.53.0
+

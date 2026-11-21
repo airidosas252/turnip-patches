@@ -1,0 +1,28 @@
+From d83dc146063e83ddaedeb48050de5e70f707dde3 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sat, 21 Nov 2026 10:16:03 +0200
+Subject: [PATCH 18/20] tu: expose shaderSharedInt64Atomics on A8XX
+
+64-bit shared memory atomics are now emitted correctly. Only enable them
+on A8XX where this was tested.
+---
+ src/freedreno/vulkan/tu_device.cc | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index dec2cff6d1b..0fd188e219d 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -543,7 +543,8 @@ tu_get_features(struct tu_physical_device *pdevice,
+    features->storagePushConstant8                = true;
+    features->shaderBufferInt64Atomics =
+       pdevice->info->props.has_64b_ssbo_atomics;
+-   features->shaderSharedInt64Atomics            = false;
++   features->shaderSharedInt64Atomics =
++      pdevice->info->props.has_64b_ssbo_atomics && pdevice->info->chip >= A8XX;
+    features->shaderFloat16                       = true;
+    features->shaderInt8                          = true;
+ 
+-- 
+2.53.0
+

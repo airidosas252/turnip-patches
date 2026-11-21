@@ -1,0 +1,1106 @@
+From a857c3b9f02916b633fb0b6f676d14bbe9c0f090 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Thu, 22 Oct 2026 20:29:23 +0300
+Subject: [PATCH 02/20] tu: Add VK_KHR_fragment_shader_barycentric for A8XX
+
+Read per-vertex inputs and barycentric weights natively from the varying
+storage:
+ - The hardware stores interpolation planes (v0, v1-v0, v2-v0).
+ - bary.f at the constant coordinates (0,0), (1,0) and (0,1) returns the
+   three vertex values.
+ - Values are split into 16-bit halves so that the plane arithmetic stays
+   bit exact.
+
+Vertex order:
+ - The hardware vertex order rotates with the provoking vertex and with
+   screen position. A runtime discriminator, a flat id compared with a
+   smooth id from the producer, recovers the Vulkan order, and a
+   provoking_last driver parameter selects the mode.
+ - Point and line topologies are handled through a shader key.
+
+Producers:
+ - The producer (VS, TES, GS or the native mesh stub VS) is rewritten to
+   emit the extra outputs the fragment shader requests.
+ - With pipeline libraries, the fragment shader records its request, and
+   the producer variant is rebuilt at link time from retained NIR.
+
+Behind TU_EXPERIMENTAL=barycentric.
+
+VK-CTS on Adreno 840 (KGSL),
+TU_EXPERIMENTAL=barycentric,mesh_shader,mesh_native:
+  dEQP-VK.fragment_shading_barycentric.*      16563 pass, 0 fail, 4428 not supported
+  (monolithic, pipeline_library and fast_linked_library: 5521 / 0 / 1476 each)
+Not supported cases are double types (no shaderFloat64).
+---
+ src/freedreno/ir3/ir3_compiler_nir.c          |   3 +
+ src/freedreno/ir3/ir3_nir.c                   |   3 +
+ src/freedreno/ir3/ir3_shader.h                |   3 +-
+ src/freedreno/vulkan/meson.build              |   1 +
+ src/freedreno/vulkan/tu_cmd_buffer.cc         |  13 +-
+ src/freedreno/vulkan/tu_device.cc             |   8 +
+ .../vulkan/tu_nir_lower_fs_barycentric.cc     | 517 ++++++++++++++++++
+ src/freedreno/vulkan/tu_nir_lower_mesh.cc     |  12 +-
+ src/freedreno/vulkan/tu_pipeline.cc           | 111 +++-
+ src/freedreno/vulkan/tu_shader.cc             |  61 ++-
+ src/freedreno/vulkan/tu_shader.h              |  29 +-
+ src/freedreno/vulkan/tu_util.cc               |   1 +
+ src/freedreno/vulkan/tu_util.h                |   1 +
+ 13 files changed, 751 insertions(+), 12 deletions(-)
+ create mode 100644 src/freedreno/vulkan/tu_nir_lower_fs_barycentric.cc
+
+diff --git a/src/freedreno/ir3/ir3_compiler_nir.c b/src/freedreno/ir3/ir3_compiler_nir.c
+index 5993957be45..7a157b6234d 100644
+--- a/src/freedreno/ir3/ir3_compiler_nir.c
++++ b/src/freedreno/ir3/ir3_compiler_nir.c
+@@ -3162,6 +3162,9 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
+    case nir_intrinsic_load_alpha_to_coverage_enable_ir3:
+       dst[0] = create_driver_param(ctx, IR3_DP_FS(alpha_to_coverage_enable));
+       break;
++   case nir_intrinsic_load_provoking_last:
++      dst[0] = create_driver_param(ctx, IR3_DP_FS(provoking_last));
++      break;
+    case nir_intrinsic_load_frag_size_ir3:
+    case nir_intrinsic_load_frag_offset_ir3:
+    case nir_intrinsic_load_gmem_frag_scale_ir3:
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index 9851ae18f90..5f66575cfc8 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1890,6 +1890,9 @@ ir3_get_driver_param_info(const nir_shader *shader,
+    case nir_intrinsic_load_alpha_to_coverage_enable_ir3:
+       param_info->offset = IR3_DP_FS(alpha_to_coverage_enable);
+       break;
++   case nir_intrinsic_load_provoking_last:
++      param_info->offset = IR3_DP_FS(provoking_last);
++      break;
+    case nir_intrinsic_load_view_index:
+       /* Report the driver-param offset for the software-multiview path
+        * (devices without HW multiview), where the view index is supplied as
+diff --git a/src/freedreno/ir3/ir3_shader.h b/src/freedreno/ir3/ir3_shader.h
+index 2d4a5377f1f..a55d2a3195d 100644
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -109,7 +109,8 @@ struct ir3_driver_params_fs {
+ #define IR3_DP_FS_DYNAMIC dword_offsetof(struct ir3_driver_params_fs, frag_invocation_count)
+    uint32_t frag_invocation_count;
+    uint32_t alpha_to_coverage_enable;
+-   uint32_t __pad_06_07[2];
++   uint32_t provoking_last;
++   uint32_t __pad_07;
+    uint32_t frag_size;
+    uint32_t __pad_09;
+    uint32_t frag_offset;
+diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
+index a7832820a42..9f4094bb727 100644
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -50,6 +50,7 @@ libtu_files = files(
+   'tu_knl.cc',
+   'tu_lrz.cc',
+   'tu_nir_lower_demote_samples.cc',
++  'tu_nir_lower_fs_barycentric.cc',
+   'tu_nir_lower_mesh.cc',
+   'tu_nir_lower_multiview.cc',
+   'tu_nir_lower_ray_query.cc',
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 099d548dc7c..cef6e4edc20 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -8483,7 +8483,8 @@ tu_emit_fdm_params(struct tu_cmd_buffer *cmd,
+    tu_cs_emit(cs, fs->fs.sample_shading ?
+               cmd->vk.dynamic_graphics_state.ms.rasterization_samples : 1);
+    tu_cs_emit(cs, cmd->vk.dynamic_graphics_state.ms.alpha_to_coverage_enable);
+-   tu_cs_emit(cs, 0);
++   tu_cs_emit(cs, cmd->vk.dynamic_graphics_state.rs.provoking_vertex ==
++                  VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT);
+    tu_cs_emit(cs, 0);
+ 
+    STATIC_ASSERT(IR3_DP_FS(frag_size) == IR3_DP_FS_DYNAMIC + 4);
+@@ -8737,7 +8738,13 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+ 
+    /* Early exit if there is nothing to emit, saves CPU cycles */
+    uint32_t dirty = cmd->state.dirty;
+-   if (!dynamic_draw_state_dirty && !(dirty & ~TU_CMD_DIRTY_COMPUTE_DESC_SETS))
++   if (!dynamic_draw_state_dirty && !(dirty & ~TU_CMD_DIRTY_COMPUTE_DESC_SETS) &&
++       !BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
++                    MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) &&
++       !BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
++                    MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
++       !BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
++                    MESA_VK_DYNAMIC_RS_PROVOKING_VERTEX))
+       return VK_SUCCESS;
+ 
+    struct tu_tess_params *tess_params = &cmd->state.tess_params;
+@@ -8858,6 +8865,8 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+                    MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) ||
+        BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
+                    MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) ||
++       BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
++                   MESA_VK_DYNAMIC_RS_PROVOKING_VERTEX) ||
+        (cmd->state.dirty & (TU_CMD_DIRTY_PROGRAM | TU_CMD_DIRTY_FDM))) {
+       tu_emit_fs_params(cmd);
+       dirty_fs_params = true;
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index e3cce8b562b..42b9689ca67 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -241,6 +241,8 @@ get_device_extensions(const struct tu_physical_device *device,
+       .KHR_external_semaphore = true,
+       .KHR_external_semaphore_fd = true,
+       .KHR_format_feature_flags2 = true,
++      .KHR_fragment_shader_barycentric = TU_EXPERIMENTAL(BARYCENTRIC) &&
++                                         device->info->chip >= A8XX,
+       .KHR_fragment_shading_rate = device->info->props.has_attachment_shading_rate,
+       .KHR_get_memory_requirements2 = true,
+       .KHR_global_priority = true,
+@@ -608,6 +610,9 @@ tu_get_features(struct tu_physical_device *pdevice,
+    /* VK_KHR_dynamic_rendering_local_read */
+    features->dynamicRenderingLocalRead = true;
+ 
++   /* VK_KHR_fragment_shader_barycentric */
++   features->fragmentShaderBarycentric = true;
++
+    /* VK_KHR_fragment_shading_rate */
+    features->pipelineFragmentShadingRate = pdevice->info->props.has_attachment_shading_rate;
+    features->primitiveFragmentShadingRate = pdevice->info->props.has_primitive_shading_rate;
+@@ -1362,6 +1367,9 @@ tu_get_properties(struct tu_physical_device *pdevice,
+    /* VK_KHR_compute_shader_derivatives */
+    props->meshAndTaskShaderDerivatives = false;
+ 
++   /* VK_KHR_fragment_shader_barycentric */
++   props->triStripVertexOrderIndependentOfProvokingVertex = false;
++
+    /* VK_KHR_fragment_shading_rate */
+    if (pdevice->info->props.has_attachment_shading_rate) {
+       props->minFragmentShadingRateAttachmentTexelSize = {8, 8};
+diff --git a/src/freedreno/vulkan/tu_nir_lower_fs_barycentric.cc b/src/freedreno/vulkan/tu_nir_lower_fs_barycentric.cc
+new file mode 100644
+index 00000000000..85f0528d436
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_nir_lower_fs_barycentric.cc
+@@ -0,0 +1,517 @@
++/*
++ * Copyright © 2026 Turnip contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "nir/nir_builder.h"
++#include "nir/nir_xfb_info.h"
++
++#include "tu_shader.h"
++
++struct bary_map {
++   uint8_t lo_slot, lo_comp, hi_slot, hi_comp;
++};
++
++struct bary_state {
++   nir_shader *producer;
++   nir_shader *fs;
++   nir_builder entry;
++
++   uint64_t free_slots;
++   unsigned smooth_slot;
++   unsigned smooth_comp;
++   bool failed;
++
++   uint64_t per_vertex_only;
++   uint64_t remove;
++   unsigned id_flat_slot;
++   struct bary_map id;
++   nir_def *rot, *is_line, *is_point;
++
++   struct bary_map map[NUM_TOTAL_VARYING_SLOTS][4];
++   bool mapped[NUM_TOTAL_VARYING_SLOTS][4];
++};
++
++static unsigned
++take_slot(struct bary_state *s)
++{
++   if (!s->free_slots) {
++      s->failed = true;
++      return VARYING_SLOT_VAR0;
++   }
++
++   unsigned slot = util_last_bit64(s->free_slots) - 1;
++   s->free_slots &= ~BITFIELD64_BIT(slot);
++   return slot;
++}
++
++static void
++alloc_smooth(struct bary_state *s, uint8_t *slot, uint8_t *comp)
++{
++   if (!s->smooth_slot || s->smooth_comp == 4) {
++      s->smooth_slot = take_slot(s);
++      s->smooth_comp = 0;
++   }
++
++   *slot = s->smooth_slot;
++   *comp = s->smooth_comp++;
++}
++
++static nir_def *
++load_flat(nir_builder *b, unsigned slot)
++{
++   return nir_load_input(b, 1, 32, nir_imm_int(b, 0),
++                         .base = 0, .component = 0,
++                         .dest_type = nir_type_uint32,
++                         .io_semantics = { .location = slot, .num_slots = 1 });
++}
++
++static nir_def *
++load_hw_vertex(nir_builder *b, unsigned slot, unsigned comp, unsigned vertex)
++{
++   nir_def *ij = nir_imm_vec2(b, vertex == 1, vertex == 2);
++   return nir_load_interpolated_input(b, 1, 32, ij, nir_imm_int(b, 0),
++                                      .base = 0, .component = comp,
++                                      .dest_type = nir_type_float32,
++                                      .io_semantics = { .location = slot, .num_slots = 1 });
++}
++
++static void
++store_smooth(nir_builder *b, nir_def *val, unsigned slot, unsigned comp)
++{
++   nir_store_output(b, val, nir_imm_int(b, 0), .base = 0, .write_mask = 1,
++                    .component = comp, .src_type = nir_type_float32,
++                    .io_semantics = { .location = slot, .num_slots = 1 });
++}
++
++static nir_def *
++load_hw_dword(nir_builder *b, const struct bary_map *m, unsigned vertex)
++{
++   nir_def *lo = nir_f2u32(b, load_hw_vertex(b, m->lo_slot, m->lo_comp, vertex));
++   nir_def *hi = nir_f2u32(b, load_hw_vertex(b, m->hi_slot, m->hi_comp, vertex));
++   return nir_ior(b, nir_ishl_imm(b, hi, 16), lo);
++}
++
++static void
++init_primitive(struct bary_state *s)
++{
++   if (s->rot)
++      return;
++
++   nir_builder *b = &s->entry;
++   nir_def *pv = load_flat(b, s->id_flat_slot);
++   nir_def *h[3];
++   for (unsigned i = 0; i < 3; i++)
++      h[i] = load_hw_dword(b, &s->id, i);
++
++   nir_def *eq10 = nir_ieq(b, h[1], h[0]);
++   nir_def *eq20 = nir_ieq(b, h[2], h[0]);
++   s->is_point = nir_iand(b, eq10, eq20);
++   s->is_line = eq20;
++   nir_def *k = nir_bcsel(b, nir_ieq(b, pv, h[0]), nir_imm_int(b, 0),
++                          nir_bcsel(b, nir_ieq(b, pv, h[1]), nir_imm_int(b, 1),
++                                    nir_imm_int(b, 2)));
++   nir_def *last = nir_ine_imm(b, nir_load_provoking_last(b), 0);
++   nir_def *off = nir_iadd(b, k, nir_b2i32(b, last));
++   s->rot = nir_bcsel(b, nir_uge_imm(b, off, 3), nir_iadd_imm(b, off, -3), off);
++}
++
++static nir_def *
++hw_vertex(struct bary_state *s, nir_builder *b, nir_def *k)
++{
++   nir_def *sum = nir_iadd(b, k, s->rot);
++   nir_def *tri = nir_bcsel(b, nir_uge_imm(b, sum, 3), nir_iadd_imm(b, sum, -3), sum);
++   nir_def *line = nir_umin(b, k, nir_imm_int(b, 1));
++
++   return nir_bcsel(b, s->is_point, nir_imm_int(b, 0),
++                    nir_bcsel(b, s->is_line, line, tri));
++}
++
++static nir_def *
++select3(nir_builder *b, nir_def *idx, nir_def *v0, nir_def *v1, nir_def *v2)
++{
++   return nir_bcsel(b, nir_ieq_imm(b, idx, 0), v0,
++                    nir_bcsel(b, nir_ieq_imm(b, idx, 1), v1, v2));
++}
++
++static nir_def *
++lower_coord(struct bary_state *s, nir_builder *b, nir_intrinsic_instr *intr)
++{
++   const enum glsl_interp_mode mode = (enum glsl_interp_mode)nir_intrinsic_interp_mode(intr);
++   nir_def *ij;
++
++   switch (intr->intrinsic) {
++   case nir_intrinsic_load_barycentric_coord_pixel:
++      ij = nir_load_barycentric_pixel(b, 32, .interp_mode = mode);
++      break;
++   case nir_intrinsic_load_barycentric_coord_centroid:
++      ij = nir_load_barycentric_centroid(b, 32, .interp_mode = mode);
++      break;
++   case nir_intrinsic_load_barycentric_coord_sample:
++      ij = nir_load_barycentric_sample(b, 32, .interp_mode = mode);
++      break;
++   case nir_intrinsic_load_barycentric_coord_at_offset:
++      ij = nir_load_barycentric_at_offset(b, 32, intr->src[0].ssa, .interp_mode = mode);
++      break;
++   default: {
++      assert(intr->intrinsic == nir_intrinsic_load_barycentric_coord_at_sample);
++      nir_def *pos = nir_load_sample_pos_from_id(b, 32, intr->src[0].ssa);
++      ij = nir_load_barycentric_at_offset(b, 32, nir_fadd_imm(b, pos, -0.5f),
++                                          .interp_mode = mode);
++      break;
++   }
++   }
++
++   init_primitive(s);
++
++   nir_def *i = nir_channel(b, ij, 0);
++   nir_def *j = nir_channel(b, ij, 1);
++   nir_def *zero = nir_imm_float(b, 0.0f);
++   nir_def *w0 = nir_fsub(b, nir_fsub_imm(b, 1.0f, i), j);
++
++   nir_def *chan[3];
++   nir_def *tri[3] = { select3(b, s->rot, w0, i, j), select3(b, s->rot, i, j, w0),
++                       select3(b, s->rot, j, w0, i) };
++   nir_def *line[3] = { nir_fsub_imm(b, 1.0f, i), i, zero };
++   nir_def *point[3] = { nir_imm_float(b, 1.0f), zero, zero };
++
++   for (unsigned k = 0; k < 3; k++) {
++      chan[k] = nir_bcsel(b, s->is_point, point[k],
++                          nir_bcsel(b, s->is_line, line[k], tri[k]));
++   }
++
++   return nir_vec(b, chan, 3);
++}
++
++static nir_def *
++read_vertex(struct bary_state *s, nir_builder *b, unsigned slot, unsigned comp,
++            nir_def *vertex)
++{
++   struct bary_map *m = &s->map[slot][comp];
++
++   if (!s->mapped[slot][comp]) {
++      alloc_smooth(s, &m->lo_slot, &m->lo_comp);
++      alloc_smooth(s, &m->hi_slot, &m->hi_comp);
++      s->mapped[slot][comp] = true;
++   }
++
++   init_primitive(s);
++
++   nir_def *v[3];
++   nir_builder *e = &s->entry;
++   for (unsigned i = 0; i < 3; i++)
++      v[i] = load_hw_dword(e, m, i);
++
++   return select3(b, hw_vertex(s, b, vertex), v[0], v[1], v[2]);
++}
++
++static bool
++lower_fs(struct bary_state *s)
++{
++   nir_function_impl *impl = nir_shader_get_entrypoint(s->fs);
++   nir_builder bld = nir_builder_create(impl), *b = &bld;
++   bool progress = false;
++
++   nir_foreach_block (block, impl) {
++      nir_foreach_instr_safe (instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++
++         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++         nir_def *res;
++
++         b->cursor = nir_before_instr(instr);
++
++         switch (intr->intrinsic) {
++         case nir_intrinsic_load_barycentric_coord_pixel:
++         case nir_intrinsic_load_barycentric_coord_centroid:
++         case nir_intrinsic_load_barycentric_coord_sample:
++         case nir_intrinsic_load_barycentric_coord_at_offset:
++         case nir_intrinsic_load_barycentric_coord_at_sample:
++            res = lower_coord(s, b, intr);
++            break;
++         case nir_intrinsic_load_input_vertex: {
++            if (intr->def.bit_size != 32 || !nir_src_is_const(intr->src[1])) {
++               s->failed = true;
++               return false;
++            }
++
++            unsigned slot = nir_intrinsic_io_semantics(intr).location +
++                            nir_src_as_uint(intr->src[1]);
++            unsigned comp = nir_intrinsic_component(intr);
++            nir_def *chan[NIR_MAX_VEC_COMPONENTS];
++
++            for (unsigned i = 0; i < intr->def.num_components; i++)
++               chan[i] = read_vertex(s, b, slot, comp + i, intr->src[0].ssa);
++
++            res = nir_vec(b, chan, intr->def.num_components);
++            break;
++         }
++         default:
++            continue;
++         }
++
++         nir_def_replace(&intr->def, res);
++         progress = true;
++      }
++   }
++
++   return progress;
++}
++
++static void
++store_dword(nir_builder *b, nir_def *val, const struct bary_map *m)
++{
++   store_smooth(b, nir_u2f32(b, nir_iand_imm(b, val, 0xffff)), m->lo_slot, m->lo_comp);
++   store_smooth(b, nir_u2f32(b, nir_ushr_imm(b, val, 16)), m->hi_slot, m->hi_comp);
++}
++
++static void
++store_ids(struct bary_state *s, nir_builder *b, nir_def *id)
++{
++   nir_store_output(b, id, nir_imm_int(b, 0), .base = 0, .write_mask = 1,
++                    .component = 0, .src_type = nir_type_uint32,
++                    .io_semantics = { .location = s->id_flat_slot, .num_slots = 1 });
++   store_dword(b, id, &s->id);
++}
++
++static void
++lower_producer(struct bary_state *s)
++{
++   nir_function_impl *impl = nir_shader_get_entrypoint(s->producer);
++   nir_builder bld = nir_builder_create(impl), *b = &bld;
++   nir_variable *emitted = NULL;
++   struct util_dynarray orig;
++
++   util_dynarray_init(&orig, NULL);
++
++   if (s->producer->info.stage == MESA_SHADER_GEOMETRY) {
++      emitted = nir_local_variable_create(impl, glsl_uint_type(), "bary_id");
++      b->cursor = nir_before_impl(impl);
++      nir_store_var(b, emitted, nir_imm_int(b, 0), 0x1);
++   }
++
++   nir_foreach_block (block, impl) {
++      nir_foreach_instr (instr, block) {
++         if (instr->type == nir_instr_type_intrinsic)
++            util_dynarray_append(&orig, instr);
++      }
++   }
++
++   util_dynarray_foreach (&orig, nir_instr *, p) {
++      nir_instr *instr = *p;
++      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++
++      if (intr->intrinsic == nir_intrinsic_emit_vertex) {
++         b->cursor = nir_before_instr(instr);
++         nir_def *id = nir_load_var(b, emitted);
++         store_ids(s, b, id);
++         nir_store_var(b, emitted, nir_iadd_imm(b, id, 1), 0x1);
++         continue;
++      }
++
++      if (intr->intrinsic != nir_intrinsic_store_output ||
++          !nir_src_is_const(intr->src[1]))
++         continue;
++
++      unsigned slot = nir_intrinsic_io_semantics(intr).location +
++                      nir_src_as_uint(intr->src[1]);
++      if (slot >= NUM_TOTAL_VARYING_SLOTS)
++         continue;
++
++      b->cursor = nir_after_instr(instr);
++
++      u_foreach_bit(i, nir_intrinsic_write_mask(intr)) {
++         unsigned comp = nir_intrinsic_component(intr) + i;
++         if (comp >= 4 || !s->mapped[slot][comp])
++            continue;
++
++         store_dword(b, nir_channel(b, intr->src[0].ssa, i), &s->map[slot][comp]);
++      }
++
++      if (slot < 64 && (s->remove & BITFIELD64_BIT(slot)))
++         nir_instr_remove(instr);
++   }
++
++   util_dynarray_fini(&orig);
++
++   if (emitted)
++      return;
++
++   b->cursor = nir_after_impl(impl);
++   nir_def *id;
++   if (s->producer->info.stage == MESA_SHADER_TESS_EVAL) {
++      nir_def *tc = nir_f2u32(b, nir_fadd_imm(b, nir_fmul_imm(b, nir_load_tess_coord_xy(b), 65535.0f), 0.5f));
++      id = nir_ior(b, nir_channel(b, tc, 0), nir_ishl_imm(b, nir_channel(b, tc, 1), 16));
++   } else {
++      id = nir_load_vertex_id(b);
++   }
++   store_ids(s, b, id);
++}
++
++bool
++tu_nir_fs_uses_barycentric(nir_shader *fs)
++{
++   nir_function_impl *impl = nir_shader_get_entrypoint(fs);
++
++   nir_foreach_shader_in_variable (var, fs) {
++      if (var->data.per_vertex)
++         return true;
++   }
++
++   nir_foreach_block (block, impl) {
++      nir_foreach_instr (instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++
++         switch (nir_instr_as_intrinsic(instr)->intrinsic) {
++         case nir_intrinsic_load_input_vertex:
++         case nir_intrinsic_load_barycentric_coord_pixel:
++         case nir_intrinsic_load_barycentric_coord_centroid:
++         case nir_intrinsic_load_barycentric_coord_sample:
++         case nir_intrinsic_load_barycentric_coord_at_offset:
++         case nir_intrinsic_load_barycentric_coord_at_sample:
++            return true;
++         default:
++            break;
++         }
++      }
++   }
++
++   return false;
++}
++
++static uint64_t
++per_vertex_only_slots(nir_shader *fs)
++{
++   uint64_t vertex = 0, other = 0;
++
++   nir_foreach_block (block, nir_shader_get_entrypoint(fs)) {
++      nir_foreach_instr (instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++
++         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++         if (intr->intrinsic != nir_intrinsic_load_input_vertex &&
++             intr->intrinsic != nir_intrinsic_load_input &&
++             intr->intrinsic != nir_intrinsic_load_interpolated_input)
++            continue;
++
++         nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
++         unsigned first = sem.location;
++         unsigned last = sem.location;
++         if (nir_src_is_const(*nir_get_io_offset_src(intr)))
++            first = last = sem.location + nir_src_as_uint(*nir_get_io_offset_src(intr));
++         else
++            last = sem.location + sem.num_slots - 1;
++
++         for (unsigned slot = first; slot <= last && slot < 64; slot++) {
++            if (intr->intrinsic == nir_intrinsic_load_input_vertex)
++               vertex |= BITFIELD64_BIT(slot);
++            else
++               other |= BITFIELD64_BIT(slot);
++         }
++      }
++   }
++
++   return vertex & ~other;
++}
++
++bool
++tu_nir_lower_fs_barycentric(nir_shader *fs, uint64_t reserved,
++                            struct tu_bary_request *req)
++{
++   memset(req, 0, sizeof(*req));
++
++   if (!tu_nir_fs_uses_barycentric(fs))
++      return true;
++
++   nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
++
++   struct bary_state *s = rzalloc(NULL, struct bary_state);
++   s->fs = fs;
++   s->entry = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(fs)));
++   s->per_vertex_only = BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32) & per_vertex_only_slots(fs);
++   s->free_slots = (BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32) &
++                    ~(fs->info.inputs_read | reserved)) | s->per_vertex_only;
++
++   alloc_smooth(s, &s->id.lo_slot, &s->id.lo_comp);
++   alloc_smooth(s, &s->id.hi_slot, &s->id.hi_comp);
++   s->id_flat_slot = take_slot(s);
++
++   lower_fs(s);
++   bool ok = !s->failed;
++   if (ok) {
++      req->per_vertex_only = s->per_vertex_only;
++      req->id_flat_slot = s->id_flat_slot;
++      req->id[0] = s->id.lo_slot;
++      req->id[1] = s->id.lo_comp;
++      req->id[2] = s->id.hi_slot;
++      req->id[3] = s->id.hi_comp;
++
++      for (unsigned slot = 0; slot < NUM_TOTAL_VARYING_SLOTS; slot++) {
++         for (unsigned comp = 0; comp < 4; comp++) {
++            if (!s->mapped[slot][comp])
++               continue;
++            if (req->count == TU_BARY_MAX_MAPPED) {
++               ok = false;
++               continue;
++            }
++            const struct bary_map *m = &s->map[slot][comp];
++            req->map[req->count++] = {
++               (uint8_t)slot, (uint8_t)comp, m->lo_slot, m->lo_comp,
++               m->hi_slot, m->hi_comp,
++            };
++         }
++      }
++   }
++
++   if (ok) {
++      nir_progress(true, nir_shader_get_entrypoint(fs), nir_metadata_none);
++      nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
++      nir_recompute_io_bases(fs, nir_var_shader_in);
++   }
++
++   ralloc_free(s);
++   return ok;
++}
++
++bool
++tu_nir_lower_producer_barycentric(nir_shader *producer,
++                                  const struct tu_bary_request *req)
++{
++   struct bary_state *s = rzalloc(NULL, struct bary_state);
++   s->producer = producer;
++   s->id_flat_slot = req->id_flat_slot;
++   s->id = { req->id[0], req->id[1], req->id[2], req->id[3] };
++   s->remove = req->per_vertex_only | BITFIELD64_BIT(req->id_flat_slot) |
++               BITFIELD64_BIT(req->id[0]) | BITFIELD64_BIT(req->id[2]);
++
++   for (unsigned i = 0; i < req->count; i++) {
++      s->map[req->map[i].slot][req->map[i].comp] = {
++         req->map[i].lo_slot, req->map[i].lo_comp,
++         req->map[i].hi_slot, req->map[i].hi_comp,
++      };
++      s->mapped[req->map[i].slot][req->map[i].comp] = true;
++      s->remove |= BITFIELD64_BIT(req->map[i].lo_slot) |
++                   BITFIELD64_BIT(req->map[i].hi_slot);
++   }
++
++   bool ok = true;
++   if (producer->xfb_info) {
++      for (unsigned i = 0; i < producer->xfb_info->output_count; i++) {
++         if (s->remove & BITFIELD64_BIT(producer->xfb_info->outputs[i].location))
++            ok = false;
++      }
++   }
++
++   if (ok) {
++      lower_producer(s);
++      nir_progress(true, nir_shader_get_entrypoint(producer), nir_metadata_none);
++      nir_shader_gather_info(producer, nir_shader_get_entrypoint(producer));
++      nir_recompute_io_bases(producer, nir_var_shader_out);
++   }
++
++   ralloc_free(s);
++   return ok;
++}
+diff --git a/src/freedreno/vulkan/tu_nir_lower_mesh.cc b/src/freedreno/vulkan/tu_nir_lower_mesh.cc
+index af09609c921..a24645e66a9 100644
+--- a/src/freedreno/vulkan/tu_nir_lower_mesh.cc
++++ b/src/freedreno/vulkan/tu_nir_lower_mesh.cc
+@@ -24,11 +24,17 @@ slot_index(const uint8_t *slots, unsigned count, unsigned slot)
+    return -1;
+ }
+ 
++static const struct glsl_type *
++fs_input_type(const nir_variable *var)
++{
++   return var->data.per_vertex ? glsl_get_array_element(var->type) : var->type;
++}
++
+ static int
+ first_prim_span_slot(const uint8_t *slots, unsigned count,
+                      const nir_variable *var)
+ {
+-   const unsigned n = nir_variable_count_slots(var, var->type);
++   const unsigned n = nir_variable_count_slots(var, fs_input_type(var));
+ 
+    for (unsigned j = 0; j < n; j++) {
+       if (slot_index(slots, count, var->data.location + j) >= 0)
+@@ -242,14 +248,14 @@ init_native_layout(struct tu_mesh_layout *layout, nir_shader *fs,
+           first_prim_span_slot(layout->prim_slots, prim_num, var) >= 0)
+          continue;
+       next = MAX2(next, loc - VARYING_SLOT_VAR0 +
+-                           glsl_count_attribute_slots(var->type, false));
++                           glsl_count_attribute_slots(fs_input_type(var), false));
+    }
+ 
+    nir_foreach_shader_in_variable (var, fs) {
+       const int first = first_prim_span_slot(layout->prim_slots, prim_num, var);
+       if (first < 0)
+          continue;
+-      const unsigned span = nir_variable_count_slots(var, var->type);
++      const unsigned span = nir_variable_count_slots(var, fs_input_type(var));
+       if (next + span > 32)
+          return "per-primitive fragment inputs do not fit in the user locations";
+       for (unsigned j = first; j < span; j++) {
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index d3933059f36..ad7a6ae01c8 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -1799,6 +1799,105 @@ tu_graphics_shader_key_init(struct tu_pipeline_builder *builder,
+    }
+ }
+ 
++static VkResult
++tu_link_bary_producer(struct tu_pipeline_builder *builder,
++                      struct tu_shader **shaders,
++                      nir_shader **post_link_nir,
++                      const struct tu_shader_key *keys_in,
++                      const struct tu_mesh_layout *mesh_layout)
++{
++   struct tu_shader_key keys[MESA_SHADER_STAGES];
++   memcpy(keys, keys_in, sizeof(keys));
++
++   const struct tu_shader *fs = shaders[MESA_SHADER_FRAGMENT];
++   if (!fs || !fs->variant || !fs->bary.id_flat_slot)
++      return VK_SUCCESS;
++
++   mesa_shader_stage producer = MESA_SHADER_NONE;
++   for (int i = MESA_SHADER_GEOMETRY; i >= MESA_SHADER_VERTEX; i--) {
++      if (i != MESA_SHADER_TESS_CTRL && shaders[i] && shaders[i]->variant) {
++         producer = static_cast<mesa_shader_stage>(i);
++         break;
++      }
++   }
++
++   if (producer == MESA_SHADER_NONE ||
++       !memcmp(&shaders[producer]->bary, &fs->bary, sizeof(fs->bary)))
++      return VK_SUCCESS;
++
++   nir_shader *nir[MESA_SHADER_STAGES] = { NULL };
++   struct tu_shader *variants[MESA_SHADER_STAGES] = { NULL };
++   VkPipelineCreationFeedback feedbacks[MESA_SHADER_STAGES] = { 0 };
++   const VkPipelineShaderStageCreateInfo *stage_infos[MESA_SHADER_STAGES] = { NULL };
++
++   for (int i = MESA_SHADER_VERTEX; i <= MESA_SHADER_FRAGMENT; i++) {
++      if (i == MESA_SHADER_VERTEX && producer == i && mesh_layout) {
++         nir[i] = mesh_layout->native ?
++            tu_nir_build_mesh_native_vs(builder->device, mesh_layout) :
++            tu_nir_build_mesh_vs(builder->device, mesh_layout);
++         ralloc_steal(builder->mem_ctx, nir[i]);
++         keys[i].native_mesh_vs = mesh_layout->native;
++         continue;
++      }
++
++      if (!post_link_nir[i]) {
++         if (i == producer || i == MESA_SHADER_FRAGMENT) {
++            mesa_loge("fragment shader barycentrics need the pipeline "
++                      "libraries to retain their shaders");
++            return VK_ERROR_UNKNOWN;
++         }
++         continue;
++      }
++
++      nir[i] = nir_shader_clone(builder->mem_ctx, post_link_nir[i]);
++      if (i != producer)
++         variants[i] = shaders[i];
++   }
++
++   blake3_hasher ctx;
++   unsigned char blake3[BLAKE3_KEY_LEN];
++   _mesa_blake3_init(&ctx);
++   _mesa_blake3_update(&ctx, shaders[producer]->base.key_data,
++                       shaders[producer]->base.key_size);
++   _mesa_blake3_update(&ctx, &fs->bary, sizeof(fs->bary));
++   _mesa_blake3_update(&ctx, builder->layout.blake3,
++                       sizeof(builder->layout.blake3));
++   _mesa_blake3_final(&ctx, blake3);
++
++   unsigned char shader_blake3[BLAKE3_KEY_LEN + 1];
++   memcpy(shader_blake3, blake3, BLAKE3_KEY_LEN);
++   shader_blake3[BLAKE3_KEY_LEN] = static_cast<unsigned char>(producer);
++
++   bool hit;
++   struct tu_shader *variant = mesh_layout ? NULL :
++      tu_pipeline_cache_lookup(builder->cache, shader_blake3,
++                               sizeof(shader_blake3), &hit);
++   if (variant) {
++      variants[producer] = variant;
++   } else {
++      VkResult result =
++         tu_compile_shaders(builder->device, builder->create_flags,
++                            stage_infos, nir, keys, &builder->layout, blake3,
++                            variants, NULL, NULL, NULL, feedbacks, NULL, NULL);
++      if (result != VK_SUCCESS)
++         return result;
++
++      if (memcmp(&variants[producer]->bary, &fs->bary, sizeof(fs->bary))) {
++         mesa_loge("fragment shader barycentrics: producer request mismatch");
++         tu_shader_destroy(builder->device, variants[producer]);
++         return VK_ERROR_UNKNOWN;
++      }
++
++      if (!mesh_layout)
++         variants[producer] =
++            tu_pipeline_cache_insert(builder->cache, variants[producer]);
++   }
++
++   vk_pipeline_cache_object_unref(&builder->device->vk, &shaders[producer]->base);
++   shaders[producer] = variants[producer];
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+                                     struct tu_pipeline *pipeline)
+@@ -1849,6 +1948,9 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+    if (task.stage_info && !mesh.stage_info)
+       return vk_error(builder->device, VK_ERROR_UNKNOWN);
+ 
++   if (TU_EXPERIMENTAL(BARYCENTRIC) && !contains_all_shader_state(builder->state))
++      retain_nir = true;
++
+    if (mesh.stage_info)
+       retain_nir = false;
+ 
+@@ -2054,9 +2156,7 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+        * successful cache hit. If we only have a "partial" cache hit, then we
+        * still need to recompile in order to get the NIR.
+        */
+-      if (cache_hit &&
+-          (builder->create_flags &
+-           VK_PIPELINE_CREATE_2_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT)) {
++      if (cache_hit && retain_nir) {
+          bool nir_application_cache_hit = false;
+          nir_shaders =
+             tu_nir_cache_lookup(builder->cache, &nir_blake3,
+@@ -2202,6 +2302,11 @@ done:
+       }
+    }
+ 
++   result = tu_link_bary_producer(builder, shaders, post_link_nir, keys,
++                               mesh.shader ? &mesh.layout : NULL);
++   if (result != VK_SUCCESS)
++      goto fail;
++
+    if (shaders[MESA_SHADER_VERTEX]) {
+       const struct ir3_shader_variant *vs =
+          shaders[MESA_SHADER_VERTEX]->variant;
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 363f5c9af5f..8eed38b4846 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -851,13 +851,16 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
+       return true;
+    }
+    case nir_intrinsic_load_frag_invocation_count:
+-   case nir_intrinsic_load_alpha_to_coverage_enable_ir3: {
++   case nir_intrinsic_load_alpha_to_coverage_enable_ir3:
++   case nir_intrinsic_load_provoking_last: {
+       if (!dev->compiler->info->props.load_shader_consts_via_preamble)
+          return false;
+ 
+       unsigned offset =
+          instr->intrinsic == nir_intrinsic_load_frag_invocation_count ?
+          IR3_DP_FS(frag_invocation_count) :
++         instr->intrinsic == nir_intrinsic_load_provoking_last ?
++         IR3_DP_FS(provoking_last) :
+          IR3_DP_FS(alpha_to_coverage_enable);
+       nir_def *result =
+          ir3_load_driver_ubo(b, 1, &shader->const_state.fdm_ubo,
+@@ -3577,6 +3580,7 @@ tu_shader_cache_process_blob(IO &io, struct tu_shader *shader)
+    io.u32(shader->view_mask);
+    io.u8(shader->active_desc_sets);
+    io.boolean(shader->per_layer_viewport);
++   io.bytes(&shader->bary, sizeof(shader->bary));
+ 
+    io.variant(shader->variant);
+ 
+@@ -3858,6 +3862,8 @@ tu_shader_create(struct tu_device *dev,
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+    shader->per_layer_viewport = info->per_layer_viewport;
++   if (info->bary)
++      memcpy(&shader->bary, info->bary, sizeof(shader->bary));
+ 
+    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+        key->fdm_per_layer) {
+@@ -4134,9 +4140,14 @@ tu_compile_shaders(struct tu_device *device,
+    nir_shader *task_nir = NULL;
+    uint32_t task_payload_size = 0;
+    bool task_native_ok = true;
++   struct tu_bary_request bary_req = {};
++   bool preset[MESA_SHADER_STAGES];
+    VkResult result = VK_SUCCESS;
+    void *mem_ctx = ralloc_context(NULL);
+ 
++   for (unsigned i = 0; i < MESA_SHADER_STAGES; i++)
++      preset[i] = !!shaders[i];
++
+    for (mesa_shader_stage stage = MESA_SHADER_VERTEX; stage < MESA_SHADER_STAGES;
+         stage = static_cast<mesa_shader_stage>(stage + 1)) {
+       const VkPipelineShaderStageCreateInfo *stage_info = stage_infos[stage];
+@@ -4248,6 +4259,9 @@ tu_compile_shaders(struct tu_device *device,
+       mesh->feedback.duration += os_time_get_nano() - stage_start;
+    }
+ 
++   if (nir[MESA_SHADER_VERTEX] && keys[MESA_SHADER_VERTEX].native_mesh_vs)
++      info[MESA_SHADER_VERTEX].native_mesh_vs = true;
++
+    if (nir[MESA_SHADER_GEOMETRY])
+       ir3_key.has_gs = true;
+ 
+@@ -4305,6 +4319,15 @@ tu_compile_shaders(struct tu_device *device,
+                      nir_var_shader_in | nir_var_shader_out);
+          }
+       }
++      if (nir[MESA_SHADER_FRAGMENT] &&
++          tu_nir_fs_uses_barycentric(nir[MESA_SHADER_FRAGMENT]))
++         link_opts(nir[MESA_SHADER_FRAGMENT], device->compiler);
++   } else if (preset[MESA_SHADER_FRAGMENT]) {
++      nir_shader *fs = nir[MESA_SHADER_FRAGMENT];
++      nir[MESA_SHADER_FRAGMENT] = NULL;
++      tu_link_shaders(device, nir, MESA_SHADER_STAGES);
++      nir[MESA_SHADER_FRAGMENT] = fs;
++      tu_link_shaders(device, &nir[MESA_SHADER_FRAGMENT], 1);
+    } else {
+       tu_link_shaders(device, nir, MESA_SHADER_STAGES);
+    }
+@@ -4319,6 +4342,40 @@ tu_compile_shaders(struct tu_device *device,
+       }
+    }
+ 
++   if (nir[MESA_SHADER_FRAGMENT] &&
++       tu_nir_fs_uses_barycentric(nir[MESA_SHADER_FRAGMENT])) {
++      nir_shader *producer = nir[MESA_SHADER_GEOMETRY] ?:
++                             nir[MESA_SHADER_TESS_EVAL] ?:
++                             nir[MESA_SHADER_VERTEX];
++
++      uint64_t reserved = 0;
++      if (mesh && mesh->layout.native) {
++         for (unsigned i = 0; i < mesh->layout.num_prim_slots; i++)
++            reserved |= BITFIELD64_BIT(mesh->layout.prim_fs_slot[i]);
++      }
++
++      link_opts(nir[MESA_SHADER_FRAGMENT], device->compiler);
++
++      if (!tu_nir_lower_fs_barycentric(nir[MESA_SHADER_FRAGMENT], reserved,
++                                       &bary_req)) {
++         mesa_loge("fragment shader barycentrics need free varying locations");
++         result = VK_ERROR_UNKNOWN;
++         goto fail;
++      }
++      info[MESA_SHADER_FRAGMENT].bary = &bary_req;
++
++      if (producer) {
++         link_opts(producer, device->compiler);
++         if (!tu_nir_lower_producer_barycentric(producer, &bary_req)) {
++            mesa_loge("fragment shader barycentrics conflict with transform "
++                      "feedback outputs");
++            result = VK_ERROR_UNKNOWN;
++            goto fail;
++         }
++         info[producer->info.stage].bary = &bary_req;
++      }
++   }
++
+    /* With pipelines, tessellation modes can be set on either shader, for
+     * compatibility with HLSL and GLSL, and the driver is supposed to merge
+     * them. Shader objects requires modes to be set on at least the TES except
+@@ -4461,7 +4518,7 @@ fail:
+ 
+    for (mesa_shader_stage stage = MESA_SHADER_VERTEX; stage < MESA_SHADER_STAGES;
+         stage = static_cast<mesa_shader_stage>(stage + 1)) {
+-      if (shaders[stage]) {
++      if (shaders[stage] && !preset[stage]) {
+          tu_shader_destroy(device, shaders[stage]);
+       }
+       if (nir_out && nir_out[stage]) {
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 9be9056a206..4b2b8a80cac 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -119,6 +119,18 @@ struct tu_mesh_layout
+    uint8_t prim_comps[64];
+ };
+ 
++#define TU_BARY_MAX_MAPPED 64
++
++struct tu_bary_request {
++   uint64_t per_vertex_only;
++   uint8_t count;
++   uint8_t id_flat_slot;
++   uint8_t id[4];
++   struct {
++      uint8_t slot, comp, lo_slot, lo_comp, hi_slot, hi_comp;
++   } map[TU_BARY_MAX_MAPPED];
++};
++
+ struct tu_shader
+ {
+    struct vk_pipeline_cache_object base;
+@@ -154,6 +166,8 @@ struct tu_shader
+     */
+    bool per_layer_viewport;
+ 
++   struct tu_bary_request bary;
++
+    union {
+       struct {
+          unsigned patch_type;
+@@ -207,7 +221,8 @@ struct tu_shader_key {
+    bool mesh : 1;
+    bool task : 1;
+    bool mesh_native : 1;
+-   uint32_t padding : 20;
++   bool native_mesh_vs : 1;
++   uint32_t padding : 19;
+ 
+    enum ir3_wavesize_option api_wavesize, real_wavesize;
+ 
+@@ -228,6 +243,7 @@ struct tu_mesh_shader
+  * lowering.
+  */
+ struct tu_shader_info {
++   const struct tu_bary_request *bary;
+    bool per_layer_viewport;
+    const struct tu_mesh_layout *native_mesh;
+    bool native_mesh_vs;
+@@ -257,6 +273,17 @@ tu_nir_lower_ray_queries(nir_shader *nir);
+ bool
+ tu_nir_lower_demote_samples(nir_shader *nir);
+ 
++bool
++tu_nir_fs_uses_barycentric(nir_shader *fs);
++
++bool
++tu_nir_lower_fs_barycentric(nir_shader *fs, uint64_t reserved,
++                            struct tu_bary_request *req);
++
++bool
++tu_nir_lower_producer_barycentric(nir_shader *producer,
++                                  const struct tu_bary_request *req);
++
+ void
+ tu_nir_mesh_layout(nir_shader *nir, struct tu_mesh_layout *layout,
+                    uint32_t task_payload_size, bool want_native,
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index 26ac359c25e..8bb29c89e64 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -63,6 +63,7 @@ static const struct debug_control tu_debug_options[] = {
+ static const struct debug_control tu_experimental_options[] = {
+    {"mesh_shader", TU_EXPERIMENTAL_MESH_SHADER },
+    {"mesh_native", TU_EXPERIMENTAL_MESH_NATIVE },
++   {"barycentric", TU_EXPERIMENTAL_BARYCENTRIC },
+    { NULL, 0 }
+ };
+ 
+diff --git a/src/freedreno/vulkan/tu_util.h b/src/freedreno/vulkan/tu_util.h
+index e620775dd3c..47c6e88d7ff 100644
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -83,6 +83,7 @@ enum tu_experimental_flags : uint64_t
+ {
+    TU_EXPERIMENTAL_MESH_SHADER = BITFIELD64_BIT(0),
+    TU_EXPERIMENTAL_MESH_NATIVE = BITFIELD64_BIT(1),
++   TU_EXPERIMENTAL_BARYCENTRIC = BITFIELD64_BIT(2),
+ };
+ 
+ struct tu_env {
+-- 
+2.53.0
+

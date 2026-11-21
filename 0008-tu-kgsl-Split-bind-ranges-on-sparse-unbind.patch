@@ -1,0 +1,252 @@
+From 629fbb786cc40a3f12b072784bcc53e16bd4d4ca Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Thu, 22 Oct 2026 20:32:55 +0300
+Subject: [PATCH 08/20] tu/kgsl: Split bind ranges on sparse unbind
+
+KGSL_GPUMEM_RANGE_OP_UNBIND removes every VBO bind range it overlaps, as
+a whole. It does not split them, while BIND does. Applications such as
+vkd3d-proton merge consecutive tiles into one bind, so unbinding a single
+tile also unmapped its neighbours.
+
+Track bound ranges per sparse VMA in an rb_tree:
+ - On unbind, unbind each overlapped range completely, then re-bind the
+   parts outside the requested range.
+ - Release BO references only after the submit ioctl. The kernel looks up
+   child ids while it prepares the ranges.
+
+VK-CTS on Adreno 840 (KGSL), unchanged before/after except where noted:
+  dEQP-VK.sparse_resources.buffer.*               142 pass, 0 fail, 99 not supported
+    (+8 ResourceError, capture_replay only)
+  dEQP-VK.sparse_resources.queue_bind.*            17 pass, 0 fail,  1 not supported
+  dEQP-VK.sparse_resources.image_sparse_residency.*  2772 / 0 / 1503
+  dEQP-VK.sparse_resources.image_sparse_binding.*    1977 / 0 / 768
+  dEQP-VK.sparse_resources.image_sparse_memory_aliasing.*  480 / 0 / 368
+  dEQP-VK.sparse_resources.image_rebind.*             256 / 0 / 224
+  dEQP-VK.sparse_resources.mipmap_sparse_residency.*  360 / 0 / 300
+The CTS does not unbind single tiles out of a larger bind. A standalone test
+(6 GiB sparse buffer, random bind/unbind churn) failed with 97683 of 381717
+tile checks reading zero before, and 0 after.
+---
+ src/freedreno/vulkan/tu_knl.h       |   2 +
+ src/freedreno/vulkan/tu_knl_kgsl.cc | 128 ++++++++++++++++++++++++++--
+ 2 files changed, 122 insertions(+), 8 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index 688baed1649..ff8146a48f7 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -13,6 +13,7 @@
+ #include <stddef.h>
+ #include <stdint.h>
+ 
++#include "util/rb_tree.h"
+ #include "util/u_atomic.h"
+ #include "vulkan/vulkan_core.h"
+ 
+@@ -119,6 +120,7 @@ struct tu_sparse_vma {
+       } msm;
+       struct {
+          struct tu_bo *virtual_bo;
++         struct rb_tree nodes;
+       } kgsl;
+    };
+ };
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index fc583828476..eea3bc0f851 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -18,6 +18,7 @@
+ 
+ #include "util/libsync.h"
+ #include "util/os_file.h"
++#include "util/rb_tree.h"
+ #include "util/timespec.h"
+ #include "util/u_debug.h"
+ #include "util/u_vector.h"
+@@ -77,6 +78,13 @@ kgsl_submitqueue_close(struct tu_device *dev, struct tu_queue *queue)
+ 
+ static void kgsl_bo_finish(struct tu_device *dev, struct tu_bo *bo);
+ 
++struct kgsl_vbo_node {
++   struct rb_node node;
++   uint64_t start, end;
++   struct tu_bo *bo;
++   uint64_t bo_offset;
++};
++
+ static VkResult
+ bo_init_new_dmaheap(struct tu_device *dev, struct tu_bo **out_bo, uint64_t size,
+                 uint64_t align, enum tu_bo_alloc_flags flags)
+@@ -636,6 +644,7 @@ kgsl_sparse_vma_init(struct tu_device *dev,
+    }
+ 
+    out_vma->kgsl.virtual_bo = bo;
++   rb_tree_init(&out_vma->kgsl.nodes);
+    *out_iova = bo->iova;
+    return VK_SUCCESS;
+ }
+@@ -648,6 +657,12 @@ kgsl_sparse_vma_finish(struct tu_device *dev,
+       .id = vma->kgsl.virtual_bo->gem_handle
+    };
+ 
++   rb_tree_foreach_safe (struct kgsl_vbo_node, n, &vma->kgsl.nodes, node) {
++      rb_tree_remove(&vma->kgsl.nodes, &n->node);
++      kgsl_bo_finish(dev, n->bo);
++      free(n);
++   }
++
+    /* Tell sparse array that entry is free */
+    memset(vma->kgsl.virtual_bo, 0, sizeof(*vma->kgsl.virtual_bo));
+ 
+@@ -1433,6 +1448,7 @@ struct tu_kgsl_queue_submit {
+    struct util_dynarray commands;
+    struct util_dynarray ranges;
+    struct util_dynarray bind_cmds;
++   struct util_dynarray unref_bos;
+    struct tu_sparse_vma *cur_vma;
+    unsigned cur_vma_range_start;
+ };
+@@ -1454,6 +1470,9 @@ kgsl_submit_finish(struct tu_device *device,
+    util_dynarray_fini(&submit->commands);
+    util_dynarray_fini(&submit->ranges);
+    util_dynarray_fini(&submit->bind_cmds);
++   util_dynarray_foreach (&submit->unref_bos, struct tu_bo *, bo)
++      kgsl_bo_finish(device, *bo);
++   util_dynarray_fini(&submit->unref_bos);
+    vk_free(&device->vk.alloc, submit);
+ }
+ 
+@@ -1478,16 +1497,59 @@ kgsl_submit_add_entries(struct tu_device *device, void *_submit,
+    }
+ }
+ 
++static int
++kgsl_vbo_node_cmp(const struct rb_node *a, const struct rb_node *b)
++{
++   const struct kgsl_vbo_node *na = rb_node_data(const struct kgsl_vbo_node, a, node);
++   const struct kgsl_vbo_node *nb = rb_node_data(const struct kgsl_vbo_node, b, node);
++   return na->start > nb->start ? -1 : na->start < nb->start;
++}
++
++static int
++kgsl_vbo_node_cmp_key(const struct rb_node *n, const void *key)
++{
++   const struct kgsl_vbo_node *node = rb_node_data(const struct kgsl_vbo_node, n, node);
++   uint64_t offset = *static_cast<const uint64_t *>(key);
++   return node->start > offset ? -1 : node->start < offset;
++}
++
++static struct kgsl_vbo_node *
++kgsl_vbo_first_overlap(struct rb_tree *tree, uint64_t start)
++{
++   struct rb_node *rn = rb_tree_search_sloppy(tree, &start, kgsl_vbo_node_cmp_key);
++   if (!rn)
++      return NULL;
++
++   struct kgsl_vbo_node *n = rb_node_data(struct kgsl_vbo_node, rn, node);
++   if (n->start > start && rb_node_prev(rn))
++      rn = rb_node_prev(rn);
++
++   n = rb_node_data(struct kgsl_vbo_node, rn, node);
++   if (n->end <= start) {
++      rn = rb_node_next(rn);
++      n = rn ? rb_node_data(struct kgsl_vbo_node, rn, node) : NULL;
++   }
++   return n;
++}
++
+ static void
+-kgsl_submit_add_bind(struct tu_device *device,
+-                     void *_submit,
+-                     struct tu_sparse_vma *vma, uint64_t vma_offset,
+-                     struct tu_bo *bo, uint64_t bo_offset,
+-                     uint64_t size)
++kgsl_vbo_insert(struct tu_sparse_vma *vma, uint64_t start, uint64_t end,
++                struct tu_bo *bo, uint64_t bo_offset)
+ {
+-   struct tu_kgsl_queue_submit *submit =
+-      static_cast<struct tu_kgsl_queue_submit *>(_submit);
++   struct kgsl_vbo_node *n = static_cast<struct kgsl_vbo_node *>(calloc(1, sizeof(*n)));
++   n->start = start;
++   n->end = end;
++   n->bo = tu_bo_get_ref(bo);
++   n->bo_offset = bo_offset;
++   rb_tree_insert(&vma->kgsl.nodes, &n->node, kgsl_vbo_node_cmp);
++}
+ 
++static void
++kgsl_submit_add_range(struct tu_kgsl_queue_submit *submit,
++                      struct tu_sparse_vma *vma, uint64_t vma_offset,
++                      struct tu_bo *bo, uint64_t bo_offset, uint64_t size,
++                      uint32_t op)
++{
+    if (vma != submit->cur_vma) {
+       unsigned range_count =
+          util_dynarray_num_elements(&submit->ranges,
+@@ -1518,12 +1580,62 @@ kgsl_submit_add_bind(struct tu_device *device,
+       .target_offset = vma_offset,
+       .length = size,
+       .child_id = bo ? bo->gem_handle : 0,
+-      .op = bo ? KGSL_GPUMEM_RANGE_OP_BIND : KGSL_GPUMEM_RANGE_OP_UNBIND,
++      .op = op,
+    };
+ 
+    util_dynarray_append(&submit->ranges, range);
+ }
+ 
++static void
++kgsl_submit_add_bind(struct tu_device *device,
++                     void *_submit,
++                     struct tu_sparse_vma *vma, uint64_t vma_offset,
++                     struct tu_bo *bo, uint64_t bo_offset,
++                     uint64_t size)
++{
++   struct tu_kgsl_queue_submit *submit =
++      static_cast<struct tu_kgsl_queue_submit *>(_submit);
++   uint64_t start = vma_offset, end = vma_offset + size;
++
++   for (struct kgsl_vbo_node *n = kgsl_vbo_first_overlap(&vma->kgsl.nodes, start);
++        n && n->start < end;) {
++      struct rb_node *next = rb_node_next(&n->node);
++      struct kgsl_vbo_node old = *n;
++
++      rb_tree_remove(&vma->kgsl.nodes, &n->node);
++      free(n);
++
++      if (!bo) {
++         kgsl_submit_add_range(submit, vma, old.start, NULL, 0,
++                               old.end - old.start,
++                               KGSL_GPUMEM_RANGE_OP_UNBIND);
++         if (old.start < start)
++            kgsl_submit_add_range(submit, vma, old.start, old.bo,
++                                  old.bo_offset, start - old.start,
++                                  KGSL_GPUMEM_RANGE_OP_BIND);
++         if (old.end > end)
++            kgsl_submit_add_range(submit, vma, end, old.bo,
++                                  old.bo_offset + (end - old.start),
++                                  old.end - end, KGSL_GPUMEM_RANGE_OP_BIND);
++      }
++
++      if (old.start < start)
++         kgsl_vbo_insert(vma, old.start, start, old.bo, old.bo_offset);
++      if (old.end > end)
++         kgsl_vbo_insert(vma, end, old.end, old.bo,
++                         old.bo_offset + (end - old.start));
++      util_dynarray_append(&submit->unref_bos, old.bo);
++
++      n = next ? rb_node_data(struct kgsl_vbo_node, next, node) : NULL;
++   }
++
++   if (bo) {
++      kgsl_vbo_insert(vma, start, end, bo, bo_offset);
++      kgsl_submit_add_range(submit, vma, vma_offset, bo, bo_offset, size,
++                            KGSL_GPUMEM_RANGE_OP_BIND);
++   }
++}
++
+ /* We don't know the actual CPU pointers until we've finished adding all the
+  * bind commands, so we put the offset from the base instead. We need to write
+  * the actual pointer after all the ranges are added. We also need to fill out
+-- 
+2.53.0
+

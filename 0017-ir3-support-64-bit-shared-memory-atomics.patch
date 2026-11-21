@@ -1,0 +1,98 @@
+From bd741da1f7b8807bc743d46f644dc126fae03cbc Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sat, 21 Nov 2026 10:16:03 +0200
+Subject: [PATCH 17/20] ir3: support 64-bit shared memory atomics
+
+emit_intrinsic_atomic_shared() only knew about 32-bit atomics: it took the
+first component of the 64-bit operands and emitted a u32 atomic. For
+cmpxchg and xchg that is wrong, and since the other 64-bit ops are lowered
+to a cmpxchg loop, the loop never saw its compare value succeed and the
+GPU hung.
+
+Emit them as TYPE_ATOMIC_U64 with the full 64-bit operands and a 64-bit
+destination, the same way the SSBO and global paths already do. This is
+what the blob does for shared memory as well. Teach ir3_validate about the
+new form, and make the disassembler print the type as u64 instead of u8.
+---
+ src/freedreno/ir3/ir3_compiler_nir.c |  8 +++++++-
+ src/freedreno/ir3/ir3_validate.c     | 17 +++++++++++++++++
+ src/freedreno/isa/ir3-cat6.xml       |  2 +-
+ 3 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/src/freedreno/ir3/ir3_compiler_nir.c b/src/freedreno/ir3/ir3_compiler_nir.c
+index 72a0f3c6def..cbb624b73c1 100644
+--- a/src/freedreno/ir3/ir3_compiler_nir.c
++++ b/src/freedreno/ir3/ir3_compiler_nir.c
+@@ -1467,6 +1467,7 @@ emit_intrinsic_atomic_shared(struct ir3_context *ctx, nir_intrinsic_instr *intr)
+    struct ir3_builder *b = &ctx->build;
+    struct ir3_instruction *atomic, *src0, *src1;
+    type_t type = TYPE_U32;
++   unsigned bit_size = intr->def.bit_size;
+ 
+    src0 = ir3_get_src(ctx, &intr->src[0])[0]; /* offset */
+    src1 = ir3_get_src(ctx, &intr->src[1])[0]; /* value */
+@@ -1510,6 +1511,11 @@ emit_intrinsic_atomic_shared(struct ir3_context *ctx, nir_intrinsic_instr *intr)
+       UNREACHABLE("boo");
+    }
+ 
++   if (bit_size == 64) {
++      type = TYPE_ATOMIC_U64;
++      atomic->dsts[0]->wrmask = MASK(2);
++   }
++
+    atomic->cat6.iim_val = 1;
+    atomic->cat6.d = 1;
+    atomic->cat6.type = type;
+@@ -1519,7 +1525,7 @@ emit_intrinsic_atomic_shared(struct ir3_context *ctx, nir_intrinsic_instr *intr)
+    /* even if nothing consume the result, we can't DCE the instruction: */
+    array_insert(ctx->block, ctx->block->keeps, atomic);
+ 
+-   return atomic;
++   return ir3_split_off_scalar(b, atomic, bit_size);
+ }
+ 
+ static void
+diff --git a/src/freedreno/ir3/ir3_validate.c b/src/freedreno/ir3/ir3_validate.c
+index ed373954c95..b442040801c 100644
+--- a/src/freedreno/ir3/ir3_validate.c
++++ b/src/freedreno/ir3/ir3_validate.c
+@@ -567,6 +567,23 @@ validate_instr(struct ir3_validate_ctx *ctx, struct ir3_instruction *instr)
+          validate_assert(ctx, !(instr->srcs[0]->flags & IR3_REG_HALF));
+          validate_assert(ctx, !(instr->srcs[1]->flags & IR3_REG_HALF));
+          break;
++      case OPC_ATOMIC_ADD:
++      case OPC_ATOMIC_MIN:
++      case OPC_ATOMIC_MAX:
++      case OPC_ATOMIC_AND:
++      case OPC_ATOMIC_OR:
++      case OPC_ATOMIC_XOR:
++      case OPC_ATOMIC_XCHG:
++      case OPC_ATOMIC_CMPXCHG:
++         if (instr->cat6.type == TYPE_ATOMIC_U64) {
++            validate_assert(ctx, !(instr->dsts[0]->flags & IR3_REG_HALF));
++            validate_assert(ctx, instr->dsts[0]->wrmask == 0x3);
++         } else {
++            validate_reg_size(ctx, instr->dsts[0], instr->cat6.type);
++         }
++         validate_assert(ctx, !(instr->srcs[0]->flags & IR3_REG_HALF));
++         validate_assert(ctx, !(instr->srcs[1]->flags & IR3_REG_HALF));
++         break;
+       case OPC_SHFL:
+          validate_reg_size(ctx, instr->srcs[0], instr->cat6.type);
+          validate_assert(ctx, !(instr->srcs[1]->flags & IR3_REG_HALF));
+diff --git a/src/freedreno/isa/ir3-cat6.xml b/src/freedreno/isa/ir3-cat6.xml
+index bff6b8ee3a4..9df37cd0a29 100644
+--- a/src/freedreno/isa/ir3-cat6.xml
++++ b/src/freedreno/isa/ir3-cat6.xml
+@@ -932,7 +932,7 @@ TODO rename UAV src to "UAV" so disasm_field_cb can find it easily?
+ 	<pattern pos="0"            >1</pattern>
+ 	<pattern low="1"  high="8"  >00000000</pattern> <!-- SRC3 -->
+ 	<pattern low="41" high="48" >00000000</pattern> <!-- SSBO/image binding point -->
+-	<field   low="49" high="51" name="TYPE" type="#type"/>
++	<field   low="49" high="51" name="TYPE" type="#type-atomic"/>
+ 	<pattern pos="52"           >0</pattern> <!-- "G" -->
+ 	<pattern pos="53"           >0</pattern> <!-- UAV_IM -->
+ </bitset>
+-- 
+2.53.0
+

@@ -1,0 +1,153 @@
+From 3cbe2f9792b66656805b4d544dc317c532c9ba22 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 25 Oct 2026 17:41:03 +0200
+Subject: [PATCH 09/20] tu: Use the native mesh path only when the kernel
+ enabled the AQE
+
+The native A8XX mesh path hands the 0x7a packet to the AQE. msm loads
+the AQE firmware only for some GPUs and reports it through
+MSM_PARAM_AQE; on the Adreno X2-90 it is not loaded yet, so a native
+mesh draw would hang the GPU. Track the AQE per physical device and
+take the compute path when TU_EXPERIMENTAL=mesh_native is set but the
+kernel reports no AQE. KGSL always loads the AQE on A8XX.
+---
+ src/freedreno/vulkan/tu_device.cc      | 13 +++++++++----
+ src/freedreno/vulkan/tu_device.h       |  2 ++
+ src/freedreno/vulkan/tu_knl_drm_msm.cc |  1 +
+ src/freedreno/vulkan/tu_knl_kgsl.cc    |  1 +
+ src/freedreno/vulkan/tu_pipeline.cc    |  7 ++++---
+ src/freedreno/vulkan/tu_shader.cc      |  2 +-
+ 6 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 8493bbb22a2..cb64a5ec168 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -837,10 +837,10 @@ tu_get_features(struct tu_physical_device *pdevice,
+ 
+    features->meshShader = true;
+    features->taskShader = true;
+-   features->multiviewMeshShader = TU_EXPERIMENTAL(MESH_NATIVE) &&
++   features->multiviewMeshShader = pdevice->mesh_native &&
+       pdevice->info->props.has_hw_multiview;
+    features->primitiveFragmentShadingRateMeshShader = false;
+-   features->meshShaderQueries = TU_EXPERIMENTAL(MESH_NATIVE);
++   features->meshShaderQueries = pdevice->mesh_native;
+ 
+    /* VK_EXT_multi_draw */
+    features->multiDraw = true;
+@@ -1386,7 +1386,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
+    tu_get_physical_device_properties_1_3(pdevice, props);
+ 
+    /* VK_KHR_compute_shader_derivatives */
+-   props->meshAndTaskShaderDerivatives = TU_EXPERIMENTAL(MESH_NATIVE);
++   props->meshAndTaskShaderDerivatives = pdevice->mesh_native;
+ 
+    /* VK_KHR_fragment_shader_barycentric */
+    props->triStripVertexOrderIndependentOfProvokingVertex = false;
+@@ -1520,7 +1520,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
+    props->maxMeshOutputPrimitives = 256;
+    props->maxMeshOutputLayers = 8;
+    props->maxMeshMultiviewViewCount =
+-      TU_EXPERIMENTAL(MESH_NATIVE) && pdevice->info->props.has_hw_multiview ? 6 : 1;
++      pdevice->mesh_native && pdevice->info->props.has_hw_multiview ? 6 : 1;
+    props->meshOutputPerVertexGranularity = 1;
+    props->meshOutputPerPrimitiveGranularity = 1;
+    props->maxPreferredTaskWorkGroupInvocations = pdevice->info->threadsize_base;
+@@ -1797,6 +1797,11 @@ tu_physical_device_init(struct tu_physical_device *device,
+    const struct fd_dev_info info = fd_dev_info(&device->dev_id);
+    assert(info.chip);
+ 
++   /* The native mesh path launches through the AQE, which the kernel may not
++    * have loaded. Fall back to the compute path then.
++    */
++   device->mesh_native = TU_EXPERIMENTAL(MESH_NATIVE) && device->has_aqe;
++
+    /* Print a suffix if raytracing is disabled by the SW fuse, in an attempt
+     * to avoid confusion when apps don't work.
+     */
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index ea183e9b2e4..704d83daa01 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -130,6 +130,8 @@ struct tu_physical_device
+ 
+    bool has_set_iova;
+    bool has_raytracing;
++   bool has_aqe;
++   bool mesh_native;
+    bool has_vm_bind;
+    /* Whether a sparse queue can be created. */
+    bool has_sparse;
+diff --git a/src/freedreno/vulkan/tu_knl_drm_msm.cc b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+index fe0ec293e31..2f511f65aac 100644
+--- a/src/freedreno/vulkan/tu_knl_drm_msm.cc
++++ b/src/freedreno/vulkan/tu_knl_drm_msm.cc
+@@ -1404,6 +1404,7 @@ tu_knl_drm_msm_load(struct tu_instance *instance,
+    device->has_raytracing = tu_drm_get_param_or(fd, MSM_PARAM_RAYTRACING, &val, false);
+    device->has_sparse_prr = tu_drm_get_param_or(fd, MSM_PARAM_HAS_PRR, &val, false);
+    device->has_gpu_timestamp = true;
++   device->has_aqe = tu_drm_get_param_or(fd, MSM_PARAM_AQE, &val, false);
+ 
+    device->has_preemption = msm_common_has_preemption(device->local_fd, device->submitqueue_priority_count / 2);
+ 
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index eea3bc0f851..1a35a02d7e5 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -2256,6 +2256,7 @@ tu_knl_kgsl_load(struct tu_instance *instance, int fd)
+ 
+    device->has_sparse = kgsl_is_virtual_bo_supported(fd);
+    device->has_sparse_prr = device->has_sparse;
++   device->has_aqe = true;
+    device->has_lazy_bos = device->has_sparse;
+    get_kgsl_prop(fd, KGSL_PROP_GPU_VA64_SIZE, &device->va_size,
+                  sizeof(device->va_size));
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index ed5f063c62f..8e6abd2e214 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -1589,7 +1589,8 @@ tu_hash_shaders(unsigned char *hash,
+                 const struct tu_shader_key *keys,
+                 VkGraphicsPipelineLibraryFlagsEXT state,
+                 const struct tu_mesh_shader *mesh,
+-                const struct tu_mesh_shader *task)
++                const struct tu_mesh_shader *task,
++                bool mesh_native)
+ {
+    blake3_hasher ctx;
+ 
+@@ -1604,7 +1605,6 @@ tu_hash_shaders(unsigned char *hash,
+       }
+    }
+    if (mesh->stage_info) {
+-      bool mesh_native = TU_EXPERIMENTAL(MESH_NATIVE);
+       _mesa_blake3_update(&ctx, &mesh_native, sizeof(mesh_native));
+       tu_hash_stage(&ctx, pipeline_flags, mesh->stage_info, NULL, &mesh->key);
+    }
+@@ -2179,7 +2179,8 @@ tu_pipeline_builder_compile_shaders(struct tu_pipeline_builder *builder,
+ 
+    unsigned char pipeline_blake3[BLAKE3_KEY_LEN];
+    tu_hash_shaders(pipeline_blake3, builder->create_flags, stage_infos, nir,
+-                   &builder->layout, keys, builder->state, &mesh, &task);
++                   &builder->layout, keys, builder->state, &mesh, &task,
++                   builder->device->physical_device->mesh_native);
+ 
+    unsigned char nir_blake3[BLAKE3_KEY_LEN + 1];
+    memcpy(nir_blake3, pipeline_blake3, sizeof(pipeline_blake3));
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 93ae02ac5e3..10c0390f209 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -4240,7 +4240,7 @@ tu_compile_shaders(struct tu_device *device,
+       }
+ 
+       tu_nir_mesh_layout(mesh_nir, &mesh->layout, task_payload_size,
+-                         TU_EXPERIMENTAL(MESH_NATIVE) && task_native_ok,
++                         device->physical_device->mesh_native && task_native_ok,
+                          nir[MESA_SHADER_FRAGMENT],
+                          keys[MESA_SHADER_VERTEX].multiview_mask);
+       if (!mesh->layout.native &&
+-- 
+2.53.0
+

@@ -24,10 +24,10 @@ fix by Artem Peshkov) until it lands. It is not part of this series.
 
 ## Patches
 
-| # | What |
-|---|------|
-| 0001 | `VK_EXT_mesh_shader` for A8XX | WIP | needs more testing
-| 0002 | `VK_KHR_fragment_shader_barycentric` for A8XX | WIP | needs more testing
+| # | What | Comments |
+|---|------|----------|
+| 0001 | `VK_EXT_mesh_shader` for A8XX | WIP, needs more testing
+| 0002 | `VK_KHR_fragment_shader_barycentric` for A8XX | WIP, needs more testing
 | 0003 | Emulate 32-wide subgroups on A8XX |
 | 0004 | Fix memory growth, XFB and mesh keys with barycentric libraries |
 | 0005 | Use a weak-ref device pipeline cache |
@@ -36,7 +36,7 @@ fix by Artem Peshkov) until it lands. It is not part of this series.
 | 0008 | kgsl: split bind ranges on sparse unbind |
 | 0009 | Use the native mesh path only when the kernel enabled the AQE |
 | 0010 | nir: keep hit attribute writes alive across `report_ray_intersection` |
-| 0011 | `VK_KHR_ray_tracing_pipeline`, experimental, WIP, see the warning below |
+| 0011 | `VK_KHR_ray_tracing_pipeline` for A8XX | experimental, WIP, see the warning below
 | 0012 | `TU_DEBUG=deck_emu`, local hack |
 | 0013 | `TU_DBG_BOLOG` and `TU_DBG_AS_LOG` debug logging, local hack |
 | 0014 | Turn on mesh_shader, mesh_native and barycentric by default, local hack |

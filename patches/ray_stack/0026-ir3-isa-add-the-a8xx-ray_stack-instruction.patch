@@ -1,0 +1,126 @@
+From a6fdbc002742426f0002892704aba24cf7014418 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 22 Nov 2026 14:06:20 +0200
+Subject: [PATCH 26/28] ir3/isa: add the a8xx ray_stack instruction
+
+Stock a8xx traversal loops step through the BVH with an undocumented
+cat6 instruction. It takes a ray_intersection result and returns the
+next node to visit, replacing the software stack.
+
+Its state is a block of 12 registers shared by the whole wave64, read
+and written in place, so it isn't an operand: ir3 picks the block after
+RA and the encoder takes it from cat6.stack_base.
+---
+ src/freedreno/ir3/disasm-a3xx.c  |  1 +
+ src/freedreno/ir3/instr-a3xx.h   |  1 +
+ src/freedreno/ir3/ir3.h          |  1 +
+ src/freedreno/ir3/tests/disasm.c |  5 ++++
+ src/freedreno/isa/ir3-cat6.xml   | 40 ++++++++++++++++++++++++++++++++
+ 5 files changed, 48 insertions(+)
+
+diff --git a/src/freedreno/ir3/disasm-a3xx.c b/src/freedreno/ir3/disasm-a3xx.c
+index e400cdaa3f3..470d989fd65 100644
+--- a/src/freedreno/ir3/disasm-a3xx.c
++++ b/src/freedreno/ir3/disasm-a3xx.c
+@@ -421,6 +421,7 @@ static const struct opc_info {
+    OPC(6, OPC_LDG_K,        ldg.k),
+    OPC(6, OPC_SHFL,         shfl),
+    OPC(6, OPC_RAY_INTERSECTION,  ray_intersection),
++   OPC(6, OPC_RAY_STACK,    ray_stack),
+ 
+    OPC(6, OPC_SPILL_MACRO,  spill.macro),
+    OPC(6, OPC_RELOAD_MACRO, reload.macro),
+diff --git a/src/freedreno/ir3/instr-a3xx.h b/src/freedreno/ir3/instr-a3xx.h
+index 83539f250fe..c36114b861c 100644
+--- a/src/freedreno/ir3/instr-a3xx.h
++++ b/src/freedreno/ir3/instr-a3xx.h
+@@ -366,6 +366,7 @@ typedef enum {
+ 
+    OPC_RAY_INTERSECTION = _OPC(6, 90),
+    OPC_RESBASE          = _OPC(6, 91),
++   OPC_RAY_STACK        = _OPC(6, 92),
+ 
+    /* category 7: */
+    OPC_BAR             = _OPC(7, 0),
+diff --git a/src/freedreno/ir3/ir3.h b/src/freedreno/ir3/ir3.h
+index 5e82c28c087..51dd04197f8 100644
+--- a/src/freedreno/ir3/ir3.h
++++ b/src/freedreno/ir3/ir3.h
+@@ -495,6 +495,7 @@ struct ir3_instruction {
+          bool coherent : 1; /* ldg, atomic.g: visible to the CP and the AQE */
+          unsigned base : 3;
+          ir3_shfl_mode shfl_mode : 3;
++         unsigned stack_base : 8; /* ray_stack: first reg of the state block */
+       } cat6;
+       struct {
+          unsigned w : 1; /* write */
+diff --git a/src/freedreno/ir3/tests/disasm.c b/src/freedreno/ir3/tests/disasm.c
+index 5cab21e112a..f941d5ef65d 100644
+--- a/src/freedreno/ir3/tests/disasm.c
++++ b/src/freedreno/ir3/tests/disasm.c
+@@ -288,6 +288,11 @@ static const struct test {
+    INSTR_7XX(c380941e_0703c079, "ray_intersection r7.z, [r3.w], r15.x, r1.w, r18.z"),
+    /* dEQP-VK.ray_query.builtin.rayqueryterminate.geom.triangles */
+    INSTR_7XX(c0260207_00630100, "resbase.untyped.1d.u32.1.imm.base0 r1.w, 1"), /* resbase.u32.1d.mode4.base0 r1.w, 1 */
++   /* rtbench rq-bounce, stock BVH traversal stack init and step. The asm
++    * parser has no syntax for it, ir3 places the state block after RA.
++    */
++   INSTR_8XX(c0200008_0049c010, "ray_stack r0.x, r2.x, r0.x, r2.x", .parse_fail = true),
++   INSTR_8XX(c0200408_1d49c010, "ray_stack r0.z, r2.x, r7.y, r2.x", .parse_fail = true),
+ 
+    /* Customely crafted */
+    INSTR_6XX(c0d61104_01800228, "stg.a.u32 g[r2.x+((r1.x+1)<<2)], r5.x, 1"),
+diff --git a/src/freedreno/isa/ir3-cat6.xml b/src/freedreno/isa/ir3-cat6.xml
+index 9df37cd0a29..03a28542773 100644
+--- a/src/freedreno/isa/ir3-cat6.xml
++++ b/src/freedreno/isa/ir3-cat6.xml
+@@ -1239,6 +1239,46 @@ TODO rename UAV src to "UAV" so disasm_field_cb can find it easily?
+ 	</encode>
+ </bitset>
+ 
++<bitset name="ray_stack" extends="#instruction-cat6">
++	<doc>
++		One step of BVH traversal. SRC is the children word, child
++		base and flags of a ray_intersection result, with 0x4000 set in
++		the flags (and 0x2000 on the root of an instance just entered).
++		DST gets the next node to visit in bits 0-28, bit 29 if the
++		traversal goes back to the top level and bit 30 when it is done.
++		The traversal state is a block of 12 registers shared by the
++		whole wave64: dword d of lane i is in register
++		STACK + (12 * i + d) / 64, lane (12 * i + d) % 64. It is updated
++		in place, STACK_SRC and STACK_DST have to name the same block.
++		With SRC = (0, 0, 0) it resets the state.
++	</doc>
++	<display>
++		{SY}{JP}{NAME} {DST}, {STACK_DST}, {SRC}, {STACK_SRC}
++	</display>
++	<gen min="800"/>
++
++	<pattern pos="0">0</pattern>
++	<field low="1" high="8" name="STACK_SRC" type="#reg-gpr"/>
++	<pattern low="9" high="13">xxxxx</pattern>
++	<pattern low="14" high="19">100111</pattern>  <!-- OPC -->
++	<pattern low="20" high="22">100</pattern>
++	<pattern pos="23">x</pattern>
++	<field low="24" high="31" name="SRC" type="#reg-gpr"/>
++	<field low="32" high="39" name="STACK_DST" type="#reg-gpr"/>
++	<pattern pos="40">x</pattern>
++	<field low="41" high="48" name="DST" type="#reg-gpr"/>
++	<pattern low="49" high="52">xxxx</pattern>
++	<pattern pos="53">1</pattern>
++	<pattern low="54" high="58">00000</pattern>
++
++	<!-- The state block is placed after RA, it isn't an operand -->
++	<encode>
++		<map name="SRC">src->srcs[0]</map>
++		<map name="STACK_SRC">&amp;(struct ir3_register){ .num = src->cat6.stack_base }</map>
++		<map name="STACK_DST">&amp;(struct ir3_register){ .num = src->cat6.stack_base }</map>
++	</encode>
++</bitset>
++
+ <!--
+ 	New a6xx+ encodings for potentially bindless image/ssbo:
+  -->
+-- 
+2.53.0
+

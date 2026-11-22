@@ -1,0 +1,374 @@
+From 31f30d7cacf9f7a7b218ec6a9c3861cc8614e67f Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 22 Nov 2026 14:06:20 +0200
+Subject: [PATCH 27/28] ir3: add ray_stack_ir3 and reserve its state block
+
+ray_stack keeps its traversal state in 12 full registers that the
+hardware shares across the wave, lane i's dword d in register
+base + (12 * i + d) / 64. RA can't treat that as a value: a copy under a
+divergent mask only moves the active lanes' columns, and RA moves and
+splits live ranges freely.
+
+So for shaders that use ray_stack, RA's full register limit is lowered
+by 12 registers, and after RA the block goes right above the highest
+register in use and is written into every ray_stack. Nothing after RA
+allocates registers, and the footprint and wave count include the
+block. Other shaders are unchanged.
+
+The instruction is kept like a store even when its result is unused
+(the reset), is ordered like a ballot, and is synced with (ss). The
+block is sized for wave64, which is all a8xx runs. Gated by a new
+has_ray_stack prop, set for a8xx only.
+---
+ src/compiler/nir/nir_divergence_analysis.c |  1 +
+ src/compiler/nir/nir_intrinsics.py         |  7 +++
+ src/freedreno/common/freedreno_dev_info.h  |  3 +
+ src/freedreno/common/freedreno_devices.py  |  1 +
+ src/freedreno/ir3/ir3.c                    |  8 +++
+ src/freedreno/ir3/ir3.h                    |  9 ++-
+ src/freedreno/ir3/ir3_compiler_nir.c       | 25 ++++++++
+ src/freedreno/ir3/ir3_legalize.c           |  2 +-
+ src/freedreno/ir3/ir3_nir.c                | 19 ++++++
+ src/freedreno/ir3/ir3_ra.c                 | 70 +++++++++++++++++++++-
+ src/freedreno/ir3/ir3_validate.c           |  4 ++
+ 11 files changed, 145 insertions(+), 4 deletions(-)
+
+diff --git a/src/compiler/nir/nir_divergence_analysis.c b/src/compiler/nir/nir_divergence_analysis.c
+index c1502e87d7c..7d6a221eded 100644
+--- a/src/compiler/nir/nir_divergence_analysis.c
++++ b/src/compiler/nir/nir_divergence_analysis.c
+@@ -1149,6 +1149,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
+    case nir_intrinsic_load_tcs_header_ir3:
+    case nir_intrinsic_load_rel_patch_id_ir3:
+    case nir_intrinsic_brcst_active_ir3:
++   case nir_intrinsic_ray_stack_ir3:
+    case nir_intrinsic_load_helper_op_id_agx:
+    case nir_intrinsic_load_helper_arg_lo_agx:
+    case nir_intrinsic_load_helper_arg_hi_agx:
+diff --git a/src/compiler/nir/nir_intrinsics.py b/src/compiler/nir/nir_intrinsics.py
+index 6e75b72ddb3..cbb8de9bdd3 100644
+--- a/src/compiler/nir/nir_intrinsics.py
++++ b/src/compiler/nir/nir_intrinsics.py
+@@ -1646,6 +1646,13 @@ load("uav_ir3", [1, 2],
+ intrinsic("ray_intersection_ir3", src_comp=[2, 1, 8, 1], dest_comp=5,
+           flags=[CAN_REORDER, CAN_ELIMINATE])
+ 
++# IR3 intrinsic for the a8xx "ray_stack" BVH traversal step.
++# src[] = { vec3(children, child base, flags) }
++# dest = next node and status
++# The traversal state is hidden in registers that the backend reserves, so it
++# has side effects: it can't be removed or reordered, even when unused.
++intrinsic("ray_stack_ir3", src_comp=[3], dest_comp=1)
++
+ # System values for freedreno geometry shaders.
+ system_value("vs_primitive_stride_ir3", 1)
+ system_value("vs_vertex_stride_ir3", 1)
+diff --git a/src/freedreno/common/freedreno_dev_info.h b/src/freedreno/common/freedreno_dev_info.h
+index 8ac1a9b250f..0959cbbee0d 100644
+--- a/src/freedreno/common/freedreno_dev_info.h
++++ b/src/freedreno/common/freedreno_dev_info.h
+@@ -454,6 +454,9 @@ struct fd_dev_info {
+       /* Whether the ray_intersection instruction is present. */
+       bool has_ray_intersection;
+ 
++      /* Whether the ray_stack BVH traversal instruction is present. */
++      bool has_ray_stack;
++
+       /* Whether features may be fused off by the SW_FUSE. So far, this is
+        * just raytracing.
+        */
+diff --git a/src/freedreno/common/freedreno_devices.py b/src/freedreno/common/freedreno_devices.py
+index 26946f90435..17a6684409f 100644
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -1396,6 +1396,7 @@ a8xx_base = GPUProps(
+         round_robin_errata = False,
+         max_texel_buffer_range_elements = (1 << 29) - 1,
+         max_storage_buffer_range_bytes = (1 << 31) - 1,
++        has_ray_stack = True,
+ 
+         QCTDD10204462 = False,
+         QCTDD10497382 = False,
+diff --git a/src/freedreno/ir3/ir3.c b/src/freedreno/ir3/ir3.c
+index 8b38c2f9b77..dd602a791be 100644
+--- a/src/freedreno/ir3/ir3.c
++++ b/src/freedreno/ir3/ir3.c
+@@ -456,6 +456,12 @@ ir3_collect_info(struct ir3_shader_variant *v)
+             regmask_init(&aliases, false);
+          }
+ 
++         if (instr->opc == OPC_RAY_STACK) {
++            info->max_reg =
++               MAX2(info->max_reg,
++                    (instr->cat6.stack_base + IR3_RAY_STACK_REGS - 1) >> 2);
++         }
++
+          if ((instr->opc == OPC_STP || instr->opc == OPC_LDP)) {
+             unsigned components = instr->srcs[2]->uim_val;
+ 
+@@ -2003,6 +2009,8 @@ ir3_valid_flags(struct ir3_instruction *instr, unsigned n, unsigned flags)
+             if (n != 0)
+                return false;
+             break;
++         case OPC_RAY_STACK:
++            return false;
+          default:
+             break;
+          }
+diff --git a/src/freedreno/ir3/ir3.h b/src/freedreno/ir3/ir3.h
+index 51dd04197f8..a0b1886ad7c 100644
+--- a/src/freedreno/ir3/ir3.h
++++ b/src/freedreno/ir3/ir3.h
+@@ -425,6 +425,11 @@ typedef enum ir3_instruction_flags {
+    IR3_INSTR_EOSTSC = BIT(26),
+ } ir3_instruction_flags;
+ 
++/* ray_stack keeps its traversal state in this many full registers, shared by
++ * the whole wave64. See place_ray_stack() in ir3_ra.c.
++ */
++#define IR3_RAY_STACK_REGS 12
++
+ struct ir3_instruction {
+    struct ir3_block *block;
+    opc_t opc;
+@@ -2148,7 +2153,8 @@ is_ss_producer(struct ir3_instruction *instr)
+    if (instr->block->in_early_preamble && writes_addr1(instr))
+       return true;
+ 
+-   return is_sfu(instr) || is_local_mem_load(instr) || instr->opc == OPC_SHFL;
++   return is_sfu(instr) || is_local_mem_load(instr) || instr->opc == OPC_SHFL ||
++          instr->opc == OPC_RAY_STACK;
+ }
+ 
+ static inline bool
+@@ -3230,6 +3236,7 @@ INSTR4(ATOMIC_S_XOR)
+ #endif
+ INSTR4NODST(LDG_K)
+ INSTR5(RAY_INTERSECTION)
++INSTR1(RAY_STACK)
+ 
+ /* cat7 instructions: */
+ INSTR0(BAR)
+diff --git a/src/freedreno/ir3/ir3_compiler_nir.c b/src/freedreno/ir3/ir3_compiler_nir.c
+index b937e491754..1a48a7ba027 100644
+--- a/src/freedreno/ir3/ir3_compiler_nir.c
++++ b/src/freedreno/ir3/ir3_compiler_nir.c
+@@ -2596,6 +2596,28 @@ emit_ray_intersection(struct ir3_context *ctx, nir_intrinsic_instr *intr,
+    ir3_split_dest(b, dst, ray_intersection, 0, 5);
+ }
+ 
++static void
++emit_ray_stack(struct ir3_context *ctx, nir_intrinsic_instr *intr,
++               struct ir3_instruction **dst)
++{
++   struct ir3_builder *b = &ctx->build;
++
++   struct ir3_instruction *node =
++      ir3_create_collect(b, ir3_get_src(ctx, &intr->src[0]), 3);
++
++   struct ir3_instruction *ray_stack = ir3_RAY_STACK(b, node, 0);
++
++   /* It updates hidden state, so keep it even when the result is unused (the
++    * reset) and keep the steps in order. Like a ballot, what it does depends
++    * on the active lanes.
++    */
++   ray_stack->barrier_class = IR3_BARRIER_ACTIVE_FIBERS_R;
++   ray_stack->barrier_conflict = IR3_BARRIER_ACTIVE_FIBERS_W;
++   array_insert(ctx->block, ctx->block->keeps, ray_stack);
++
++   dst[0] = ray_stack;
++}
++
+ static void setup_input(struct ir3_context *ctx, nir_intrinsic_instr *intr);
+ static void setup_output(struct ir3_context *ctx, nir_intrinsic_instr *intr);
+ 
+@@ -3536,6 +3558,9 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
+    case nir_intrinsic_ray_intersection_ir3:
+       emit_ray_intersection(ctx, intr, dst);
+       break;
++   case nir_intrinsic_ray_stack_ir3:
++      emit_ray_stack(ctx, intr, dst);
++      break;
+    case nir_intrinsic_convert_alu_types:
+       emit_intrinsic_convert_alu_types(ctx, intr, dst);
+       create_rpt = true;
+diff --git a/src/freedreno/ir3/ir3_legalize.c b/src/freedreno/ir3/ir3_legalize.c
+index e55ac5f7c2e..32f2ed2a501 100644
+--- a/src/freedreno/ir3/ir3_legalize.c
++++ b/src/freedreno/ir3/ir3_legalize.c
+@@ -232,7 +232,7 @@ sync_update(struct ir3_legalize_state *state, struct ir3_compiler *compiler,
+ 
+    bool n_is_scalar_alu = is_scalar_alu(n, compiler);
+ 
+-   if (is_sfu(n) || n->opc == OPC_SHFL)
++   if (is_sfu(n) || n->opc == OPC_SHFL || n->opc == OPC_RAY_STACK)
+       regmask_set(&state->needs_ss, n->dsts[0]);
+ 
+    foreach_dst (dst, n) {
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index cf86cf04106..6158545b5c9 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -680,6 +680,22 @@ ir3_nir_lower_shader_clock(nir_shader *shader, struct ir3_compiler *compiler)
+                                      nir_metadata_none, compiler);
+ }
+ 
++static bool
++has_ray_stack(nir_shader *s)
++{
++   nir_foreach_function_impl (impl, s) {
++      nir_foreach_block (block, impl) {
++         nir_foreach_instr (instr, block) {
++            if (instr->type == nir_instr_type_intrinsic &&
++                nir_instr_as_intrinsic(instr)->intrinsic ==
++                   nir_intrinsic_ray_stack_ir3)
++               return true;
++         }
++      }
++   }
++   return false;
++}
++
+ /* nir_opt_uniform_atomics reads the result of the last active lane. */
+ static bool
+ lower_last_invocation(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+@@ -1675,6 +1691,9 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
+     */
+    if (so->compiler->has_pvtmem) {
+       struct ir3_pressure limit_pressure = ir3_ra_get_reg_file_limits(so);
++      /* RA keeps the ray_stack block free, so arrays can't use it either. */
++      if (has_ray_stack(s))
++         limit_pressure.full -= IR3_RAY_STACK_REGS * 2;
+       progress |=
+          OPT(s, nir_lower_vars_to_scratch_global,
+              glsl_get_natural_size_align_bytes, ir3_vars_to_scratch_cb, &limit_pressure);
+diff --git a/src/freedreno/ir3/ir3_ra.c b/src/freedreno/ir3/ir3_ra.c
+index 02706b073a2..7188bf25ec2 100644
+--- a/src/freedreno/ir3/ir3_ra.c
++++ b/src/freedreno/ir3/ir3_ra.c
+@@ -2785,6 +2785,59 @@ ir3_ra_get_reg_file_limits(struct ir3_shader_variant *v)
+    return limit_pressure;
+ }
+ 
++/* The last full register that reg uses, plus one. */
++static unsigned
++reg_full_end(const struct ir3_register *reg, bool merged_regs)
++{
++   if (!is_reg_gpr(reg))
++      return 0;
++
++   unsigned last = (reg->flags & IR3_REG_RELATIV)
++                      ? reg->array.base + reg->size - 1
++                      : reg->num + util_last_bit(reg->wrmask) - 1;
++
++   if (last >= regid(48, 0))
++      return 0;
++   if (reg->flags & IR3_REG_HALF)
++      return merged_regs ? last / 2 + 1 : 0;
++   return last + 1;
++}
++
++/* The hardware keeps the ray_stack traversal state in IR3_RAY_STACK_REGS full
++ * registers shared by the wave: dword d of lane i is in register
++ * base + (12 * i + d) / 64. RA can't hold that as a value, because a copy
++ * under a divergent mask only moves the columns of the active lanes. So RA
++ * leaves room for it, and the block goes right above the highest register the
++ * shader uses, where nothing touches it. It's one block for the whole shader,
++ * each traversal starts with a reset.
++ */
++static void
++place_ray_stack(struct ir3_shader_variant *v)
++{
++   unsigned base = 0;
++
++   foreach_block (block, &v->ir->block_list) {
++      foreach_instr (instr, &block->instr_list) {
++         foreach_dst (dst, instr)
++            base = MAX2(base, reg_full_end(dst, v->mergedregs));
++         foreach_src (src, instr)
++            base = MAX2(base, reg_full_end(src, v->mergedregs));
++      }
++   }
++
++   assert(base + IR3_RAY_STACK_REGS <= regid(48, 0));
++
++   foreach_block (block, &v->ir->block_list) {
++      foreach_instr (instr, &block->instr_list) {
++         if (instr->opc == OPC_RAY_STACK)
++            instr->cat6.stack_base = base;
++      }
++   }
++
++   /* The block is sized for wave64. */
++   v->shader_options.real_wavesize = IR3_SINGLE_ONLY;
++}
++
+ int
+ ir3_ra(struct ir3_shader_variant *v)
+ {
+@@ -2809,8 +2862,10 @@ ir3_ra(struct ir3_shader_variant *v)
+    ir3_merge_regs(live, v->ir);
+ 
+    bool has_shared_vectors = false;
++   bool has_ray_stack = false;
+    foreach_block (block, &v->ir->block_list) {
+       foreach_instr (instr, &block->instr_list) {
++         has_ray_stack |= instr->opc == OPC_RAY_STACK;
+          ra_foreach_dst (dst, instr) {
+             if ((dst->flags & IR3_REG_SHARED) && reg_elems(dst) > 1) {
+                has_shared_vectors = true;
+@@ -2829,6 +2884,10 @@ ir3_ra(struct ir3_shader_variant *v)
+ 
+    struct ir3_pressure limit_pressure = ir3_ra_get_reg_file_limits(v);
+ 
++   /* Leave room for the ray_stack block, placed after RA. */
++   unsigned reserved = has_ray_stack ? IR3_RAY_STACK_REGS * 2 : 0;
++   limit_pressure.full -= reserved;
++
+    /* If requested, lower the limit so that spilling happens more often. */
+    if (ir3_shader_debug & IR3_DBG_SPILLALL)
+       calc_min_limit_pressure(v, live, &limit_pressure);
+@@ -2906,9 +2965,13 @@ ir3_ra(struct ir3_shader_variant *v)
+       rzalloc_array(ctx, struct ra_interval, live->definitions_count);
+    ctx->blocks = rzalloc_array(ctx, struct ra_block_state, live->block_count);
+ 
+-   unsigned full_limit = v->mergedregs ? RA_FULL_SIZE : limit_pressure.full;
++   unsigned full_limit =
++      v->mergedregs ? RA_FULL_SIZE - reserved : limit_pressure.full;
+ 
+-   ctx->full.size = calc_target_full_pressure(v, max_pressure.full, full_limit);
++   /* The ray_stack block counts towards the footprint that sets the waves. */
++   ctx->full.size = calc_target_full_pressure(v, max_pressure.full + reserved,
++                                              full_limit + reserved) -
++                    reserved;
+    assert(ctx->full.size <= full_limit);
+    d("full size: %u", ctx->full.size);
+ 
+@@ -2963,6 +3026,9 @@ ir3_ra(struct ir3_shader_variant *v)
+ 
+    ir3_debug_print(v->ir, "AFTER: ir3_lower_copies");
+ 
++   if (has_ray_stack)
++      place_ray_stack(v);
++
+    ralloc_free(ctx);
+ 
+    return 0;
+diff --git a/src/freedreno/ir3/ir3_validate.c b/src/freedreno/ir3/ir3_validate.c
+index 84ffd19b215..b948b4fd399 100644
+--- a/src/freedreno/ir3/ir3_validate.c
++++ b/src/freedreno/ir3/ir3_validate.c
+@@ -599,6 +599,10 @@ validate_instr(struct ir3_validate_ctx *ctx, struct ir3_instruction *instr)
+          validate_assert(ctx, !(instr->srcs[4]->flags & IR3_REG_HALF));
+          validate_assert(ctx, !(instr->dsts[0]->flags & IR3_REG_HALF));
+          break;
++      case OPC_RAY_STACK:
++         validate_assert(ctx, !(instr->srcs[0]->flags & IR3_REG_HALF));
++         validate_assert(ctx, !(instr->dsts[0]->flags & IR3_REG_HALF));
++         break;
+       default:
+          validate_reg_size(ctx, instr->dsts[0], instr->cat6.type);
+          validate_assert(ctx, !(instr->srcs[0]->flags & IR3_REG_HALF));
+-- 
+2.53.0
+

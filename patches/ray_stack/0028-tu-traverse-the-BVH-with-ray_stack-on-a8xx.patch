@@ -1,0 +1,519 @@
+From 71a11a405bdba43ed56521222c140692bb3bc6e9 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 22 Nov 2026 14:06:20 +0200
+Subject: [PATCH 28/28] tu: traverse the BVH with ray_stack on a8xx
+
+Follow the stock driver: one ray_stack step per visited node replaces
+the software stack, its watermark and parent pointer fallback, and the
+instance top/bottom bookkeeping. Leaves with primitives left are
+intersected again and instances are entered without a step, the step
+after an instance entry carries the enter bit. The step result is kept
+in current_node and its done/top level bits are handled at the top of
+the loop, so a candidate returned to the app keeps its object space
+ray. The query's initialization resets the state.
+
+There is one state block per shader, so it's used for the traversals
+of ray tracing pipelines, which never interleave, and for shaders with
+a single ray query outside ray tracing stages. Everything else, and
+A7xx, keeps the software stack, built exactly as before.
+---
+ .../vulkan/tu_nir_lower_ray_query.cc          | 298 ++++++++++++------
+ src/freedreno/vulkan/tu_rt_pipeline.cc        |   6 +-
+ src/freedreno/vulkan/tu_shader.cc             |  10 +-
+ src/freedreno/vulkan/tu_shader.h              |   2 +-
+ 4 files changed, 217 insertions(+), 99 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_nir_lower_ray_query.cc b/src/freedreno/vulkan/tu_nir_lower_ray_query.cc
+index 931f4ce12c1..2f154825221 100644
+--- a/src/freedreno/vulkan/tu_nir_lower_ray_query.cc
++++ b/src/freedreno/vulkan/tu_nir_lower_ray_query.cc
+@@ -70,6 +70,15 @@ enum rq_var_index {
+ 
+ #define MAX_STACK_DEPTH 8
+ 
++/* ray_stack takes the ray_intersection flags with these added. */
++#define TU_RAY_STACK_STEP           0x4000
++#define TU_RAY_STACK_ENTER_INSTANCE 0x2000
++
++/* ray_stack result: the next node and its status bits. */
++#define TU_RAY_STACK_NODE_MASK 0x1fffffff
++#define TU_RAY_STACK_TOP_LEVEL (1u << 29)
++#define TU_RAY_STACK_DONE      (1u << 30)
++
+ static const glsl_type *
+ get_rq_type(void)
+ {
+@@ -316,7 +325,7 @@ tu_nir_load_tlas_address(nir_builder *b, nir_def *descriptor)
+ 
+ static void
+ lower_rq_initialize(nir_builder *b, struct hash_table *ht,
+-                    nir_intrinsic_instr *intr)
++                    nir_intrinsic_instr *intr, nir_variable *stack_flags)
+ {
+    struct rq_var *var;
+    nir_deref_instr *rq = get_rq_deref(b, ht, intr->src[0].ssa, &var);
+@@ -393,13 +402,20 @@ lower_rq_initialize(nir_builder *b, struct hash_table *ht,
+    rq_store(b, rq, root_bvh_base, root_bvh_base, 0x3);
+    rq_store(b, rq, bvh_base, root_bvh_base, 0x3);
+ 
+-   rq_store(b, rq, stack_ptr, nir_imm_int(b, 0), 0x1);
+-   rq_store(b, rq, top_stack, nir_imm_int(b, -1), 0x1);
+-   rq_store(b, rq, stack_low_watermark, nir_imm_int(b, 0), 0x1);
+-   rq_store(b, rq, current_node, nir_imm_int(b, 0), 0x1);
+-   rq_store(b, rq, previous_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
+-   rq_store(b, rq, instance_top_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
+-   rq_store(b, rq, instance_bottom_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
++   if (stack_flags) {
++      /* A step with no node resets the state. */
++      nir_ray_stack_ir3(b, 32, nir_imm_zero(b, 3, 32));
++      nir_store_var(b, stack_flags, nir_imm_int(b, TU_RAY_STACK_STEP), 0x1);
++      rq_store(b, rq, current_node, nir_imm_int(b, 0), 0x1);
++   } else {
++      rq_store(b, rq, stack_ptr, nir_imm_int(b, 0), 0x1);
++      rq_store(b, rq, top_stack, nir_imm_int(b, -1), 0x1);
++      rq_store(b, rq, stack_low_watermark, nir_imm_int(b, 0), 0x1);
++      rq_store(b, rq, current_node, nir_imm_int(b, 0), 0x1);
++      rq_store(b, rq, previous_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
++      rq_store(b, rq, instance_top_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
++      rq_store(b, rq, instance_bottom_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
++   }
+ 
+    rq_store(b, rq, incomplete, nir_imm_true(b), 0x1);
+ }
+@@ -586,7 +602,7 @@ fetch_parent_node(nir_builder *b, nir_def *bvh, nir_def *node)
+ static nir_def *
+ build_ray_traversal(nir_builder *b, nir_deref_instr *rq,
+                     nir_def *tlas, nir_def *uav_index,
+-                    gl_access_qualifier access)
++                    gl_access_qualifier access, nir_variable *stack_flags)
+ {
+    nir_deref_instr *candidate = rq_deref(b, rq, candidate);
+    nir_deref_instr *closest = rq_deref(b, rq, closest);
+@@ -598,110 +614,140 @@ build_ray_traversal(nir_builder *b, nir_deref_instr *rq,
+    {
+       nir_loop_add_continue_construct(loop);
+ 
+-      /* Go up the stack if current_node == VK_BVH_INVALID_NODE */
+-      nir_push_if(b, nir_ieq_imm(b, rq_load(b, rq, current_node), VK_BVH_INVALID_NODE));
+-      {
+-         /* Early exit if we never overflowed the stack, to avoid having to backtrack to
+-          * the root for no reason. */
+-         nir_push_if(b, nir_ilt_imm(b, rq_load(b, rq, stack_ptr), 1));
++      nir_def *bvh_node, *bvh_base, *prev_node = NULL;
++
++      if (stack_flags) {
++         /* current_node holds the last ray_stack result. Its status is
++          * handled here rather than right after the step, because the
++          * candidate's object space ray must survive a return to the app.
++          */
++         nir_def *next = rq_load(b, rq, current_node);
++
++         nir_push_if(b, nir_test_mask(b, next, TU_RAY_STACK_DONE));
+          {
+             nir_store_var(b, incomplete, nir_imm_false(b), 0x1);
+             nir_jump(b, nir_jump_break);
+          }
+          nir_pop_if(b, NULL);
+ 
+-         nir_def *stack_instance_exit =
+-            nir_ige(b, rq_load(b, rq, top_stack), rq_load(b, rq, stack_ptr));
+-         nir_def *root_instance_exit =
+-            nir_ieq(b, rq_load(b, rq, previous_node), rq_load(b, rq, instance_bottom_node));
+-         nir_if *instance_exit = nir_push_if(b, nir_ior(b, stack_instance_exit, root_instance_exit));
+-         instance_exit->control = nir_selection_control_dont_flatten;
++         nir_if *top_level =
++            nir_push_if(b, nir_test_mask(b, next, TU_RAY_STACK_TOP_LEVEL));
++         top_level->control = nir_selection_control_dont_flatten;
+          {
+-            rq_store(b, rq, top_stack, nir_imm_int(b, -1), 1);
+-            rq_store(b, rq, previous_node, rq_load(b, rq, instance_top_node), 1);
+-            rq_store(b, rq, instance_bottom_node, nir_imm_int(b, TU_BVH_NO_INSTANCE_ROOT), 1);
+-
+             rq_store(b, rq, bvh_base, rq_load(b, rq, root_bvh_base), 3);
+             rqi_store(b, candidate, origin, rq_load(b, rq, world_origin), 7);
+             rqi_store(b, candidate, direction, rq_load(b, rq, world_direction), 7);
+          }
+          nir_pop_if(b, NULL);
+ 
+-         nir_push_if(
+-            b, nir_ige(b, rq_load(b, rq, stack_low_watermark), rq_load(b, rq, stack_ptr)));
++         bvh_node = nir_iand_imm(b, next, TU_RAY_STACK_NODE_MASK);
++         bvh_base = rq_load(b, rq, bvh_base);
++      } else {
++         /* Go up the stack if current_node == VK_BVH_INVALID_NODE */
++         nir_push_if(b, nir_ieq_imm(b, rq_load(b, rq, current_node), VK_BVH_INVALID_NODE));
+          {
+-            /* Get the parent of the previous node using the parent pointers.
+-             * We will re-intersect the parent and figure out what index the
+-             * previous node was below.
+-             */
+-            nir_def *prev = rq_load(b, rq, previous_node);
+-            nir_def *bvh_addr = rq_load(b, rq, bvh_base);
+-
+-            nir_def *parent = fetch_parent_node(b, bvh_addr, prev);
+-            nir_push_if(b, nir_ieq_imm(b, parent, VK_BVH_INVALID_NODE));
++            /* Early exit if we never overflowed the stack, to avoid having to backtrack to
++             * the root for no reason. */
++            nir_push_if(b, nir_ilt_imm(b, rq_load(b, rq, stack_ptr), 1));
+             {
+                nir_store_var(b, incomplete, nir_imm_false(b), 0x1);
+                nir_jump(b, nir_jump_break);
+             }
+             nir_pop_if(b, NULL);
+-            rq_store(b, rq, current_node, parent, 0x1);
+-         }
+-         nir_push_else(b, NULL);
+-         {
+-            /* Go up the stack and get the next child of the parent. */
+-            nir_def *stack_ptr = nir_iadd_imm(b, rq_load(b, rq, stack_ptr), -1);
+-
+-            nir_def *stack_idx =
+-               nir_umod_imm(b, stack_ptr, MAX_STACK_DEPTH);
+-            nir_deref_instr *stack_deref =
+-               nir_build_deref_array(b, rq_deref(b, rq, stack), stack_idx);
+-            nir_def *stack_entry = nir_load_deref(b, stack_deref);
+-            nir_def *children_base = nir_channel(b, stack_entry, 0);
+-            nir_def *children = nir_channel(b, stack_entry, 1);
+-
+-            nir_def *next_child_idx =
+-               nir_iadd_imm(b, nir_iand_imm(b, children, 0x1f), -3);
+-            
+-            nir_def *child_offset =
+-               nir_iand_imm(b, nir_ishr(b, children, next_child_idx), 0x7);
+-            nir_def *bvh_node = nir_iadd(b, children_base, child_offset);
+-
+-            nir_push_if(b, nir_ieq_imm(b, next_child_idx, 8));
++
++            nir_def *stack_instance_exit =
++               nir_ige(b, rq_load(b, rq, top_stack), rq_load(b, rq, stack_ptr));
++            nir_def *root_instance_exit =
++               nir_ieq(b, rq_load(b, rq, previous_node), rq_load(b, rq, instance_bottom_node));
++            nir_if *instance_exit = nir_push_if(b, nir_ior(b, stack_instance_exit, root_instance_exit));
++            instance_exit->control = nir_selection_control_dont_flatten;
+             {
+-               rq_store(b, rq, stack_ptr, stack_ptr, 1);
++               rq_store(b, rq, top_stack, nir_imm_int(b, -1), 1);
++               rq_store(b, rq, previous_node, rq_load(b, rq, instance_top_node), 1);
++               rq_store(b, rq, instance_bottom_node, nir_imm_int(b, TU_BVH_NO_INSTANCE_ROOT), 1);
++
++               rq_store(b, rq, bvh_base, rq_load(b, rq, root_bvh_base), 3);
++               rqi_store(b, candidate, origin, rq_load(b, rq, world_origin), 7);
++               rqi_store(b, candidate, direction, rq_load(b, rq, world_direction), 7);
++            }
++            nir_pop_if(b, NULL);
++
++            nir_push_if(
++               b, nir_ige(b, rq_load(b, rq, stack_low_watermark), rq_load(b, rq, stack_ptr)));
++            {
++               /* Get the parent of the previous node using the parent pointers.
++                * We will re-intersect the parent and figure out what index the
++                * previous node was below.
++                */
++               nir_def *prev = rq_load(b, rq, previous_node);
++               nir_def *bvh_addr = rq_load(b, rq, bvh_base);
++
++               nir_def *parent = fetch_parent_node(b, bvh_addr, prev);
++               nir_push_if(b, nir_ieq_imm(b, parent, VK_BVH_INVALID_NODE));
++               {
++                  nir_store_var(b, incomplete, nir_imm_false(b), 0x1);
++                  nir_jump(b, nir_jump_break);
++               }
++               nir_pop_if(b, NULL);
++               rq_store(b, rq, current_node, parent, 0x1);
+             }
+             nir_push_else(b, NULL);
+             {
+-               children = nir_bitfield_insert(b, children, next_child_idx,
+-                                              nir_imm_int(b, 0),
+-                                              nir_imm_int(b, 5));
+-               nir_store_deref(b, stack_deref,
+-                               nir_vec2(b, nir_undef(b, 1, 32), children),
+-                               0x2);
++               /* Go up the stack and get the next child of the parent. */
++               nir_def *stack_ptr = nir_iadd_imm(b, rq_load(b, rq, stack_ptr), -1);
++
++               nir_def *stack_idx =
++                  nir_umod_imm(b, stack_ptr, MAX_STACK_DEPTH);
++               nir_deref_instr *stack_deref =
++                  nir_build_deref_array(b, rq_deref(b, rq, stack), stack_idx);
++               nir_def *stack_entry = nir_load_deref(b, stack_deref);
++               nir_def *children_base = nir_channel(b, stack_entry, 0);
++               nir_def *children = nir_channel(b, stack_entry, 1);
++
++               nir_def *next_child_idx =
++                  nir_iadd_imm(b, nir_iand_imm(b, children, 0x1f), -3);
++
++               nir_def *child_offset =
++                  nir_iand_imm(b, nir_ishr(b, children, next_child_idx), 0x7);
++               nir_def *bvh_node = nir_iadd(b, children_base, child_offset);
++
++               nir_push_if(b, nir_ieq_imm(b, next_child_idx, 8));
++               {
++                  rq_store(b, rq, stack_ptr, stack_ptr, 1);
++               }
++               nir_push_else(b, NULL);
++               {
++                  children = nir_bitfield_insert(b, children, next_child_idx,
++                                                 nir_imm_int(b, 0),
++                                                 nir_imm_int(b, 5));
++                  nir_store_deref(b, stack_deref,
++                                  nir_vec2(b, nir_undef(b, 1, 32), children),
++                                  0x2);
++               }
++               nir_pop_if(b, NULL);
++
++               rq_store(b, rq, current_node, bvh_node, 0x1);
++               /* We don't need previous_node when we have the stack. Indicate to
++                * the internal intersection handling below that this isn't the
++                * underflow case.
++                */
++               rq_store(b, rq, previous_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
+             }
+             nir_pop_if(b, NULL);
+-
+-            rq_store(b, rq, current_node, bvh_node, 0x1);
+-            /* We don't need previous_node when we have the stack. Indicate to
+-             * the internal intersection handling below that this isn't the
+-             * underflow case.
+-             */
++         }
++         nir_push_else(b, NULL);
++         {
+             rq_store(b, rq, previous_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
+          }
+          nir_pop_if(b, NULL);
+-      }
+-      nir_push_else(b, NULL);
+-      {
+-         rq_store(b, rq, previous_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
+-      }
+-      nir_pop_if(b, NULL);
+ 
+-      nir_def *bvh_node = rq_load(b, rq, current_node);
+-      nir_def *bvh_base = rq_load(b, rq, bvh_base);
++         bvh_node = rq_load(b, rq, current_node);
++         bvh_base = rq_load(b, rq, bvh_base);
+ 
+-      nir_def *prev_node = rq_load(b, rq, previous_node);
+-      rq_store(b, rq, previous_node, bvh_node, 0x1);
+-      rq_store(b, rq, current_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
++         prev_node = rq_load(b, rq, previous_node);
++         rq_store(b, rq, previous_node, bvh_node, 0x1);
++         rq_store(b, rq, current_node, nir_imm_int(b, VK_BVH_INVALID_NODE), 0x1);
++      }
+ 
+       nir_def *origin = rqi_load(b, candidate, origin);
+       nir_def *tmin = rq_load(b, rq, tmin);
+@@ -726,16 +772,51 @@ build_ray_traversal(nir_builder *b, nir_deref_instr *rq,
+          nir_ubitfield_extract_imm(b, intersection_flags, 4, 4);
+       nir_def *intersection_id = nir_channel(b, intrinsic_result, 1);
+ 
++      if (stack_flags) {
++         /* A leaf with primitives left is intersected again and an instance
++          * is entered at node 0 of its BVH, both without a step.
++          */
++         nir_def *is_leaf =
++            nir_test_mask(b, intersection_flags, TU_INTERSECTION_TYPE_LEAF);
++         nir_def *leaf_pending =
++            nir_iand(b, is_leaf, nir_test_mask(b, intersection_flags, 0xf));
++         nir_def *enter_instance =
++            nir_iand(b, nir_iand(b, is_leaf,
++                                 nir_ine_imm(b, intersection_count, 0)),
++                     nir_test_mask(b, intersection_flags,
++                                   TU_INTERSECTION_TYPE_TLAS));
++
++         nir_push_if(b, nir_ior(b, leaf_pending, enter_instance));
++         {
++            rq_store(b, rq, current_node, bvh_node, 0x1);
++         }
++         nir_push_else(b, NULL);
++         {
++            nir_def *step_flags =
++               nir_ior(b, intersection_flags, nir_load_var(b, stack_flags));
++            nir_def *next =
++               nir_ray_stack_ir3(b, 32,
++                                 nir_vec3(b,
++                                          nir_channel(b, intrinsic_result, 3),
++                                          intersection_id, step_flags));
++            rq_store(b, rq, current_node, next, 0x1);
++            nir_store_var(b, stack_flags, nir_imm_int(b, TU_RAY_STACK_STEP), 0x1);
++         }
++         nir_pop_if(b, NULL);
++      }
++
+       nir_push_if(b, nir_test_mask(b, intersection_flags,
+                                    TU_INTERSECTION_TYPE_LEAF));
+       {
+          nir_def *processed_mask = nir_iand_imm(b, intersection_flags, 0xf);
+ 
+          /* Keep processing the current node if the mask isn't yet 0 */
+-         rq_store(b, rq, current_node,
+-                  nir_bcsel(b, nir_ieq_imm(b, processed_mask, 0),
+-                            nir_imm_int(b, VK_BVH_INVALID_NODE),
+-                            bvh_node), 1);
++         if (!stack_flags) {
++            rq_store(b, rq, current_node,
++                     nir_bcsel(b, nir_ieq_imm(b, processed_mask, 0),
++                               nir_imm_int(b, VK_BVH_INVALID_NODE),
++                               bvh_node), 1);
++         }
+ 
+          /* If the mask is 0, replace with the initial 0xf for the next
+           * intersection.
+@@ -788,13 +869,22 @@ build_ray_traversal(nir_builder *b, nir_deref_instr *rq,
+ 
+             rqi_store(b, candidate, sbt_offset, sbt_offset, 1);
+ 
+-            rq_store(b, rq, top_stack, rq_load(b, rq, stack_ptr), 1);
++            if (!stack_flags)
++               rq_store(b, rq, top_stack, rq_load(b, rq, stack_ptr), 1);
+             rq_store(b, rq, bvh_base, blas_bvh, 3);
+ 
+             /* Push the instance root node onto the stack */
+             rq_store(b, rq, current_node, nir_imm_int(b, 0), 0x1);
+-            rq_store(b, rq, instance_bottom_node, nir_imm_int(b, 0), 1);
+-            rq_store(b, rq, instance_top_node, bvh_node, 1);
++            if (stack_flags) {
++               /* The next step tells ray_stack about the instance root. */
++               nir_store_var(b, stack_flags,
++                             nir_imm_int(b, TU_RAY_STACK_STEP |
++                                            TU_RAY_STACK_ENTER_INSTANCE),
++                             0x1);
++            } else {
++               rq_store(b, rq, instance_bottom_node, nir_imm_int(b, 0), 1);
++               rq_store(b, rq, instance_top_node, bvh_node, 1);
++            }
+ 
+             /* Transform the ray into object space */
+             rqi_store(b, candidate, origin,
+@@ -870,7 +960,7 @@ build_ray_traversal(nir_builder *b, nir_deref_instr *rq,
+          nir_pop_if(b, NULL);
+       }
+       nir_push_else(b, NULL);
+-      {
++      if (!stack_flags) {
+          /* internal */
+          nir_push_if(b, nir_ine_imm(b, intersection_count, 0));
+          {
+@@ -971,7 +1061,8 @@ build_ray_traversal(nir_builder *b, nir_deref_instr *rq,
+ }
+ 
+ static nir_def *
+-lower_rq_proceed(nir_builder *b, struct hash_table *ht, nir_intrinsic_instr *intr)
++lower_rq_proceed(nir_builder *b, struct hash_table *ht, nir_intrinsic_instr *intr,
++                 nir_variable *stack_flags)
+ {
+    struct rq_var *var;
+    nir_deref_instr *rq = get_rq_deref(b, ht, intr->src[0].ssa, &var);
+@@ -981,7 +1072,8 @@ lower_rq_proceed(nir_builder *b, struct hash_table *ht, nir_intrinsic_instr *int
+ 
+    nir_push_if(b, nir_load_deref(b, rq_deref(b, rq, incomplete)));
+    {
+-      nir_def *incomplete = build_ray_traversal(b, rq, tlas, uav_index, access);
++      nir_def *incomplete = build_ray_traversal(b, rq, tlas, uav_index, access,
++                                                stack_flags);
+       nir_store_deref(b, rq_deref(b, rq, incomplete), incomplete, 0x1);
+    }
+    nir_pop_if(b, NULL);
+@@ -990,7 +1082,7 @@ lower_rq_proceed(nir_builder *b, struct hash_table *ht, nir_intrinsic_instr *int
+ }
+ 
+ bool
+-tu_nir_lower_ray_queries(nir_shader *shader)
++tu_nir_lower_ray_queries(nir_shader *shader, bool use_ray_stack)
+ {
+    bool progress = false;
+    struct hash_table *query_ht = _mesa_pointer_hash_table_create(NULL);
+@@ -1010,6 +1102,19 @@ tu_nir_lower_ray_queries(nir_shader *shader)
+ 
+       nir_builder builder = nir_builder_create(function->impl);
+ 
++      bool has_query = progress;
++      nir_foreach_variable_in_list (var, &function->impl->locals)
++         has_query |= var->data.ray_query;
++
++      /* The flags of the next ray_stack step. Like the state, they are shared
++       * by all queries, and NULL selects the software stack.
++       */
++      nir_variable *stack_flags =
++         use_ray_stack && has_query
++            ? nir_local_variable_create(function->impl, glsl_uint_type(),
++                                        "ray_stack_flags")
++            : NULL;
++
+       nir_foreach_variable_in_list (var, &function->impl->locals) {
+          if (!var->data.ray_query)
+             continue;
+@@ -1043,13 +1148,14 @@ tu_nir_lower_ray_queries(nir_shader *shader)
+                lower_rq_generate_intersection(&builder, query_ht, intrinsic);
+                break;
+             case nir_intrinsic_rq_initialize:
+-               lower_rq_initialize(&builder, query_ht, intrinsic);
++               lower_rq_initialize(&builder, query_ht, intrinsic, stack_flags);
+                break;
+             case nir_intrinsic_rq_load:
+                new_dest = lower_rq_load(&builder, query_ht, intrinsic);
+                break;
+             case nir_intrinsic_rq_proceed:
+-               new_dest = lower_rq_proceed(&builder, query_ht, intrinsic);
++               new_dest = lower_rq_proceed(&builder, query_ht, intrinsic,
++                                           stack_flags);
+                break;
+             case nir_intrinsic_rq_terminate:
+                lower_rq_terminate(&builder, query_ht, intrinsic);
+diff --git a/src/freedreno/vulkan/tu_rt_pipeline.cc b/src/freedreno/vulkan/tu_rt_pipeline.cc
+index 68d0b77d1e4..173bfa5566e 100644
+--- a/src/freedreno/vulkan/tu_rt_pipeline.cc
++++ b/src/freedreno/vulkan/tu_rt_pipeline.cc
+@@ -1080,7 +1080,11 @@ rt_create_shader(struct tu_device *dev, nir_shader *nir,
+ {
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+-   NIR_PASS(_, nir, tu_nir_lower_ray_queries);
++   /* The traversals made by the pipeline never interleave, since
++    * maxRayRecursionDepth is 1, so they can share the ray_stack state.
++    */
++   NIR_PASS(_, nir, tu_nir_lower_ray_queries,
++            dev->compiler->info->props.has_ray_stack);
+    NIR_PASS(_, nir, nir_split_var_copies);
+    NIR_PASS(_, nir, nir_lower_var_copies);
+    NIR_PASS(_, nir, nir_opt_copy_prop_vars);
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index aab8f8f67fe..391d25aab19 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -274,9 +274,17 @@ tu_spirv_to_nir(struct tu_device *dev,
+    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+ 
+    if (nir->info.ray_queries > 0) {
++      /* There is one ray_stack state per shader, so queries that may
++       * interleave keep the software stack: several of them, or one in a ray
++       * tracing stage, which can be live across the pipeline's traversal.
++       */
++      bool use_ray_stack = dev->compiler->info->props.has_ray_stack &&
++                           nir->info.ray_queries == 1 &&
++                           !mesa_shader_stage_is_rt(stage);
++
+       NIR_PASS(_, nir, nir_opt_ray_queries);
+       NIR_PASS(_, nir, nir_opt_ray_query_ranges);
+-      NIR_PASS(_, nir, tu_nir_lower_ray_queries);
++      NIR_PASS(_, nir, tu_nir_lower_ray_queries, use_ray_stack);
+    }
+ 
+    NIR_PASS(_, nir, nir_split_var_copies);
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index b086d23fff2..ca9c2878805 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -352,7 +352,7 @@ bool
+ tu_nir_lower_multiview_sw_fs(nir_shader *nir);
+ 
+ bool
+-tu_nir_lower_ray_queries(nir_shader *nir);
++tu_nir_lower_ray_queries(nir_shader *nir, bool use_ray_stack);
+ 
+ /* The address of the acceleration structure that a descriptor of it is for. */
+ nir_def *
+-- 
+2.53.0
+

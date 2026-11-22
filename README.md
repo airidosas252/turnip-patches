@@ -42,8 +42,8 @@ git am $TP/patches/fixes/*.patch $TP/patches/x2-90/*.patch
 ```
 
 The rest build on each other. `mesh_shader`, `fragment_shader_barycentric`,
-`subgroups`, `performance` and `ray_tracing_pipeline` (0001 to 0011, plus
-0025) only apply together and in `series` order. In `local`, 0014 needs the
+`subgroups`, `performance`, `ray_tracing_pipeline` and `ray_stack` (0001 to
+0011, plus 0025 to 0028) only apply together and in `series` order. In `local`, 0014 needs the
 mesh and barycentric patches, while 0012 and 0013 apply on their own.
 
 ## Patches
@@ -84,6 +84,20 @@ The numbers keep the order of the whole series.
 |---|------|----------|
 | 0010 | nir: keep hit attribute writes alive across `report_ray_intersection` | |
 | 0011 | `VK_KHR_ray_tracing_pipeline` for A8XX | Experimental, see below |
+
+**ray_stack**
+
+| # | What | Comments |
+|---|------|----------|
+| 0026 | ir3/isa: add the A8XX `ray_stack` instruction | |
+| 0027 | ir3: add `ray_stack_ir3` and reserve its state block | |
+| 0028 | Traverse the BVH with `ray_stack` on A8XX | Ray queries and RT pipelines 10-17% faster |
+
+These use an undocumented A8XX instruction that does one step of BVH traversal
+in hardware, the way Qualcomm's driver does. It replaces the traversal stack in
+the shader. The stack lives in a block of 12 registers shared by the whole wave,
+so the compiler keeps that block out of register allocation. Shaders with more
+than one ray query keep the old path.
 
 **shader_int64_atomics**
 

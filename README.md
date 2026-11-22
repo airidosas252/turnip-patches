@@ -19,50 +19,115 @@ lot of it is still work in progress.
 
 ## Applying
 
-From a Mesa checkout:
+The patches are in folders by feature, and `series` lists all of them in the
+order they apply. From a Mesa checkout:
 
 ```
 git checkout -b turnip-a8xx 6c2135ab766
-git am /path/to/turnip-patches/patches/*.patch
+TP=/path/to/turnip-patches
+git am $(sed "s|^|$TP/|" $TP/series)
 ```
 
 The A840 and X2-90 also need upstream MR !46551, Artem Peshkov's fix for the
 A8XX VPC position cache size. It isn't in this series, so apply it as well
 until it lands upstream.
 
+### Picking only some folders
+
+`fixes`, `x2-90`, `shader_int64_atomics` and `fully_covered` apply on their
+own, in any combination:
+
+```
+git am $TP/patches/fixes/*.patch $TP/patches/x2-90/*.patch
+```
+
+The rest build on each other. `mesh_shader`, `fragment_shader_barycentric`,
+`subgroups`, `performance` and `ray_tracing_pipeline` (0001 to 0011) only apply
+together and in `series` order. In `local`, 0014 needs the mesh and barycentric
+patches, while 0012 and 0013 apply on their own.
+
 ## Patches
+
+The numbers keep the order of the whole series.
+
+**mesh_shader**
 
 | # | What | Comments |
 |---|------|----------|
 | 0001 | `VK_EXT_mesh_shader` for A8XX | WIP, needs more testing |
-| 0002 | `VK_KHR_fragment_shader_barycentric` for A8XX | WIP, needs more testing |
-| 0003 | Emulate 32-wide subgroups on A8XX | |
-| 0004 | Fix memory growth, XFB and mesh keys with barycentric libraries | |
-| 0005 | Use a weak-ref device pipeline cache | |
 | 0006 | Extend the native A8XX mesh path | |
-| 0007 | Reduce fragment preamble cost | |
-| 0008 | kgsl: split bind ranges on sparse unbind | |
 | 0009 | Use the native mesh path only when the kernel enabled the AQE | |
+
+**fragment_shader_barycentric**
+
+| # | What | Comments |
+|---|------|----------|
+| 0002 | `VK_KHR_fragment_shader_barycentric` for A8XX | WIP, needs more testing |
+| 0004 | Fix memory growth, XFB and mesh keys with barycentric libraries | |
+
+**subgroups**
+
+| # | What | Comments |
+|---|------|----------|
+| 0003 | Emulate 32-wide subgroups on A8XX | |
+
+**performance**
+
+| # | What | Comments |
+|---|------|----------|
+| 0007 | Reduce fragment preamble cost | |
+
+**ray_tracing_pipeline**
+
+| # | What | Comments |
+|---|------|----------|
 | 0010 | nir: keep hit attribute writes alive across `report_ray_intersection` | |
 | 0011 | `VK_KHR_ray_tracing_pipeline` for A8XX | Experimental, see below |
-| 0012 | `TU_DEBUG=deck_emu` | Local hack |
-| 0013 | `TU_DBG_BOLOG` and `TU_DBG_AS_LOG` debug logging | Local hack |
-| 0014 | Turn mesh_shader, mesh_native and barycentric on by default | Local hack |
-| 0015 | freedreno: full sysmem depth CCU cache on X2-90 | Fixes a GPU hang |
-| 0016 | freedreno: add the X2-90 chip id the laptop kernel reports | |
+
+**shader_int64_atomics**
+
+| # | What | Comments |
+|---|------|----------|
 | 0017 | ir3: 64-bit shared memory atomics | |
 | 0018 | Expose `shaderSharedInt64Atomics` on A8XX | |
 | 0019 | ir3: native 64-bit umin/umax atomics on A8XX | |
+
+**fully_covered**
+
+| # | What | Comments |
+|---|------|----------|
 | 0020 | Expose `fullyCoveredFragmentShaderInputVariable` on A8XX | |
+
+**x2-90**
+
+| # | What | Comments |
+|---|------|----------|
+| 0015 | freedreno: full sysmem depth CCU cache on X2-90 | Fixes a GPU hang |
+| 0016 | freedreno: add the X2-90 chip id the laptop kernel reports | |
+
+**fixes**
+
+| # | What | Comments |
+|---|------|----------|
+| 0005 | Use a weak-ref device pipeline cache | |
+| 0008 | kgsl: split bind ranges on sparse unbind | |
 | 0021 | ir3: keep spill next-use distances only for live-in and live-out values | Huge shaders no longer run out of memory |
 | 0022 | ir3: don't rescan the whole shader after every jump change | Huge shaders compile about 5x faster |
 | 0023 | Fix the header pointers when copying an acceleration structure | Fixes GPU faults after compaction |
 
-0012, 0013 and 0014 are hacks for my own setup and won't go upstream. Skip
-them if you only want the features.
-
 0021, 0022 and 0023 fix bugs that are also in upstream Mesa, so they're worth
 having even without the ray tracing patch. 0023 affects ray queries too.
+
+**local**
+
+| # | What | Comments |
+|---|------|----------|
+| 0012 | `TU_DEBUG=deck_emu` | Local hack |
+| 0013 | `TU_DBG_BOLOG` and `TU_DBG_AS_LOG` debug logging | Local hack |
+| 0014 | Turn mesh_shader, mesh_native and barycentric on by default | Local hack |
+
+These are hacks for my own setup and won't go upstream. Skip them if you only
+want the features.
 
 ## Ray tracing pipelines (0011)
 

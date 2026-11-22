@@ -135,9 +135,10 @@ want the features.
 
 This one is experimental. It passes the ray tracing pipeline CTS and runs a few
 small test apps and Quake II RTX. Cyberpunk 2077 also works with every ray
-tracing option (with 0021 to 0023), but it's very slow. Cronos (a 46-stage
-pipeline) used to run out of memory while compiling, and I haven't tried it
-again since 0021.
+tracing option (with 0021 to 0023). 0025 made it usable: the built-in benchmark
+at 2560x1600, FSR 2.1 Balanced, RT local shadows on, went from 3.5 to 16.9 FPS
+average on the X2-90. Cronos (a 46-stage pipeline) used to run out of memory
+while compiling, and I haven't tried it again since 0021.
 
 It's off unless `TU_EXPERIMENTAL` contains `rt_pipeline`.
 

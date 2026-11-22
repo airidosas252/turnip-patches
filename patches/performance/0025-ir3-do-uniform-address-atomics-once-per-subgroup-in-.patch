@@ -1,0 +1,66 @@
+From 0ca6274e565a72a58447f75e04385a4aac1f707c Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 22 Nov 2026 10:53:17 +0200
+Subject: [PATCH 25/25] ir3: do uniform-address atomics once per subgroup in
+ compute shaders
+
+Run nir_opt_uniform_atomics like RADV, Intel and Asahi do. Atomics that
+every lane of a subgroup does on the same address become one atomic and
+a subgroup reduction. ir3 had no lowering for the last_invocation
+intrinsic the pass uses, so add one.
+
+The acceleration structure build does a lot of these, and contended
+global atomics are very slow on A8XX. Building a 540k triangle BLAS on
+X2-90 goes from 900 ms to 60 ms, which is close to the proprietary
+driver.
+
+Fragment shaders crash with it, so it's only enabled for compute.
+---
+ src/freedreno/ir3/ir3_nir.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/freedreno/ir3/ir3_nir.c b/src/freedreno/ir3/ir3_nir.c
+index 1a4aa808674..cf86cf04106 100644
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -680,6 +680,19 @@ ir3_nir_lower_shader_clock(nir_shader *shader, struct ir3_compiler *compiler)
+                                      nir_metadata_none, compiler);
+ }
+ 
++/* nir_opt_uniform_atomics reads the result of the last active lane. */
++static bool
++lower_last_invocation(nir_builder *b, nir_intrinsic_instr *intr, void *data)
++{
++   if (intr->intrinsic != nir_intrinsic_last_invocation)
++      return false;
++
++   b->cursor = nir_before_instr(&intr->instr);
++   nir_def *active = nir_ballot(b, 4, 32, nir_imm_true(b));
++   nir_def_replace(&intr->def, nir_ballot_find_msb(b, active));
++   return true;
++}
++
+ static bool
+ ir3_nir_lower_sparse_residency_cb(nir_builder *b, nir_intrinsic_instr *instr,
+                                   void *data)
+@@ -1130,6 +1143,17 @@ ir3_nir_post_finalize(struct ir3_shader *shader)
+          options.lower_vote_trivial = true;
+       }
+ 
++      /* When every lane of a subgroup hits the same address, do the atomic once
++       * for the subgroup. Contended global atomics are very slow on Adreno.
++       * Compute only for now: fragment shaders crash with it.
++       */
++      if (compiler->gen >= 6 && mesa_shader_stage_is_compute(s->info.stage) &&
++          !shader->options.virtual_subgroup32 &&
++          OPT(s, nir_opt_uniform_atomics, false)) {
++         OPT(s, nir_shader_intrinsics_pass, lower_last_invocation,
++             nir_metadata_control_flow, NULL);
++      }
++
+       if (!shader->options.virtual_subgroup32_split)
+          OPT(s, nir_opt_uniform_subgroup, &options);
+       OPT(s, nir_lower_subgroups, &options);
+-- 
+2.53.0
+

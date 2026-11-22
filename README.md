@@ -42,9 +42,9 @@ git am $TP/patches/fixes/*.patch $TP/patches/x2-90/*.patch
 ```
 
 The rest build on each other. `mesh_shader`, `fragment_shader_barycentric`,
-`subgroups`, `performance` and `ray_tracing_pipeline` (0001 to 0011) only apply
-together and in `series` order. In `local`, 0014 needs the mesh and barycentric
-patches, while 0012 and 0013 apply on their own.
+`subgroups`, `performance` and `ray_tracing_pipeline` (0001 to 0011, plus
+0025) only apply together and in `series` order. In `local`, 0014 needs the
+mesh and barycentric patches, while 0012 and 0013 apply on their own.
 
 ## Patches
 
@@ -76,6 +76,7 @@ The numbers keep the order of the whole series.
 | # | What | Comments |
 |---|------|----------|
 | 0007 | Reduce fragment preamble cost | |
+| 0025 | ir3: do uniform-address atomics once per subgroup in compute shaders | Big acceleration structure builds 15-25x faster, needs 0024 |
 
 **ray_tracing_pipeline**
 
@@ -114,9 +115,10 @@ The numbers keep the order of the whole series.
 | 0021 | ir3: keep spill next-use distances only for live-in and live-out values | Huge shaders no longer run out of memory |
 | 0022 | ir3: don't rescan the whole shader after every jump change | Huge shaders compile about 5x faster |
 | 0023 | Fix the header pointers when copying an acceleration structure | Fixes GPU faults after compaction |
+| 0024 | nir: only merge atomics when the buffer or image is uniform too | Needed by 0025 |
 
-0021, 0022 and 0023 fix bugs that are also in upstream Mesa, so they're worth
-having even without the ray tracing patch. 0023 affects ray queries too.
+0021 to 0024 fix bugs that are also in upstream Mesa, so they're worth having
+even without the ray tracing patch. 0023 affects ray queries too.
 
 **local**
 

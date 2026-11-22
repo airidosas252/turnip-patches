@@ -1,0 +1,46 @@
+From 2003e71c202a140de714241a85aa124120bbe0a7 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 22 Nov 2026 10:53:17 +0200
+Subject: [PATCH 24/25] nir/opt_uniform_atomics: require a uniform buffer or
+ image too
+
+The pass only checked that the offset or image coordinate was the same
+in every lane. When lanes used different buffers or images at the same
+offset, it merged their atomics into one on the elected lane's buffer
+and the others were never updated.
+
+Drivers that turn non-uniform descriptors into a loop never hit this,
+but ir3 handles them in hardware, so it can.
+---
+ src/compiler/nir/nir_opt_uniform_atomics.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/src/compiler/nir/nir_opt_uniform_atomics.c b/src/compiler/nir/nir_opt_uniform_atomics.c
+index e338d4fef2f..d54402112b5 100644
+--- a/src/compiler/nir/nir_opt_uniform_atomics.c
++++ b/src/compiler/nir/nir_opt_uniform_atomics.c
+@@ -45,8 +45,9 @@ parse_atomic(nir_intrinsic_instr *intr, unsigned *offset_src,
+ {
+    switch (intr->intrinsic) {
+    case nir_intrinsic_ssbo_atomic:
++      /* The buffer has to be uniform too. */
+       *offset_src = 1;
+-      *offset2_src = *offset_src;
++      *offset2_src = 0;
+       return true;
+    case nir_intrinsic_shared_atomic:
+    case nir_intrinsic_global_atomic:
+@@ -62,8 +63,9 @@ parse_atomic(nir_intrinsic_instr *intr, unsigned *offset_src,
+    case nir_intrinsic_image_atomic:
+    case nir_intrinsic_bindless_image_atomic:
+    case nir_intrinsic_image_heap_atomic:
++      /* The image has to be uniform too. */
+       *offset_src = 1;
+-      *offset2_src = *offset_src;
++      *offset2_src = 0;
+       return true;
+ 
+    default:
+-- 
+2.53.0
+

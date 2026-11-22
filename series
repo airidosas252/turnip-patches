@@ -21,3 +21,5 @@ patches/fully_covered/0020-tu-expose-fullyCoveredFragmentShaderInputVariable-on.
 patches/fixes/0021-ir3-spill-keep-next-use-distances-only-for-live-in-a.patch
 patches/fixes/0022-ir3-legalize-don-t-rescan-the-whole-shader-after-eve.patch
 patches/fixes/0023-tu-rebase-the-header-pointers-when-copying-an-accele.patch
+patches/fixes/0024-nir-opt_uniform_atomics-require-a-uniform-buffer-or-.patch
+patches/performance/0025-ir3-do-uniform-address-atomics-once-per-subgroup-in-.patch

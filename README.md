@@ -42,8 +42,9 @@ git am $TP/patches/fixes/*.patch $TP/patches/x2-90/*.patch
 ```
 
 The rest build on each other. `mesh_shader`, `fragment_shader_barycentric`,
-`subgroups`, `performance`, `ray_tracing_pipeline` and `ray_stack` (0001 to
-0011, plus 0025 to 0028) only apply together and in `series` order. In `local`, 0014 needs the
+`subgroups`, `performance`, `ray_tracing_pipeline`, `ray_stack` and
+`gmem_stack` (0001 to 0011, plus 0025 to 0032) only apply together and in
+`series` order. In `local`, 0014 needs the
 mesh and barycentric patches, while 0012 and 0013 apply on their own.
 
 ## Patches
@@ -84,6 +85,12 @@ The numbers keep the order of the whole series.
 |---|------|----------|
 | 0010 | nir: keep hit attribute writes alive across `report_ray_intersection` | |
 | 0011 | `VK_KHR_ray_tracing_pipeline` for A8XX | Experimental, see below |
+| 0032 | ir3: encode the coherent bit of global atomics | Fixes every global atomic being slow since 0011 |
+
+0011 made every global atomic in every shader take the slow coherent path that
+only the AQE needs, because the encoder never wrote the bit that picks it. That
+cost Quake II RTX ray queries 59 to 45 FPS until 0025 hid most of it. 0032 puts
+normal atomics back to what upstream emits.
 
 **ray_stack**
 
@@ -98,6 +105,22 @@ in hardware, the way Qualcomm's driver does. It replaces the traversal stack in
 the shader. The stack lives in a block of 12 registers shared by the whole wave,
 so the compiler keeps that block out of register allocation. Shaders with more
 than one ray query keep the old path.
+
+**gmem_stack**
+
+| # | What | Comments |
+|---|------|----------|
+| 0029 | ir3: emit `getspid` and `getwid` for the SM and warp ID intrinsics | |
+| 0030 | Fix the alignment of the separate mode stack accesses | |
+| 0031 | Keep the bottom of the separate mode ray tracing stack in GMEM | RT pipelines up to 2x faster with big payloads |
+
+The separate mode of 0011 keeps a stack per ray in private memory, which goes
+to DRAM. 0031 puts the first part of each stack, where most accesses go, in
+GMEM (the GPU's on-chip tile memory, several times faster than DRAM) and the
+rest in a driver-owned buffer. On the X2-90 it made test pipelines 3-13%
+faster, about 2x with 256-byte payloads, and Cyberpunk 2077 went from about
+17 to 19 FPS. One test case with 128 hit groups got about 10% slower. It's on
+by default on A8XX, and `TU_DEBUG=nogmemstack` turns it off.
 
 **shader_int64_atomics**
 
@@ -151,7 +174,7 @@ This one is experimental. It passes the ray tracing pipeline CTS and runs a few
 small test apps and Quake II RTX. Cyberpunk 2077 also works with every ray
 tracing option (with 0021 to 0023). 0025 made it usable: the built-in benchmark
 at 2560x1600, FSR 2.1 Balanced, RT local shadows on, went from 3.5 to 16.9 FPS
-average on the X2-90. Cronos (a 46-stage pipeline) used to run out of memory
+average on the X2-90, and with 0026 to 0031 it's at about 19 FPS. Cronos (a 46-stage pipeline) used to run out of memory
 while compiling, and I haven't tried it again since 0021.
 
 It's off unless `TU_EXPERIMENTAL` contains `rt_pipeline`.
@@ -178,6 +201,7 @@ These only matter with `rt_pipeline` (0011):
   pipelines are monolithic and big ones are separate.
 - `TU_RT_AQE_MAX_ACTIVE=<n>` caps the rays in flight in `aqe` mode. For testing.
 - `TU_DBG_RT_SKIP=1` skips ray tracing dispatches. For debugging.
+- `TU_DEBUG=nogmemstack` keeps the separate mode stack out of GMEM (0031).
 
 Debugging (0012, 0013):
 

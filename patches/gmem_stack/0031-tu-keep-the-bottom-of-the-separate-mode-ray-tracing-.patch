@@ -1,0 +1,571 @@
+From 4e92a9f3aa3e11518356efe016452f3d995c7fb0 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 22 Nov 2026 22:04:48 +0200
+Subject: [PATCH 31/32] tu: keep the bottom of the separate mode ray tracing
+ stack in GMEM
+
+The stack of the separate mode lives in private memory, which goes
+through the caches to DRAM. Most of the accesses are to the bottom of
+the stack, so keep that part in GMEM, which is much faster, and the rest
+in a BO owned by the driver. Each wave slot of each SP has a share of
+both, laid out like private memory, and an access picks its base with a
+select, which is cheaper than a branch around it.
+
+A8XX keeps the CCU and VPC caches at the top of GMEM in both modes, the
+stack goes below them. A thread that has no share of GMEM uses the BO
+for the whole stack, so a wrong guess of the wave slots costs speed but
+not correctness.
+
+It is on for A8XX, TU_DEBUG=nogmemstack turns it off.
+---
+ src/freedreno/vulkan/tu_cmd_buffer.cc  | 127 ++++++++++++++--
+ src/freedreno/vulkan/tu_cmd_buffer.h   |   3 +
+ src/freedreno/vulkan/tu_device.cc      |   7 +
+ src/freedreno/vulkan/tu_device.h       |  10 ++
+ src/freedreno/vulkan/tu_rt_pipeline.cc |   2 +
+ src/freedreno/vulkan/tu_rt_pipeline.h  |   6 +
+ src/freedreno/vulkan/tu_rt_separate.cc | 197 +++++++++++++++++++++++++
+ src/freedreno/vulkan/tu_shader.h       |  11 +-
+ src/freedreno/vulkan/tu_util.cc        |   1 +
+ src/freedreno/vulkan/tu_util.h         |   1 +
+ 10 files changed, 349 insertions(+), 16 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index f0fde2c53ca..0ca4a054749 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -11178,31 +11178,30 @@ tu_rt_prepass(struct tu_cmd_buffer *cmd, uint64_t indirect_va, uint64_t launch,
+                             false);
+ }
+ 
+-/* The scratch BO of the AQE launches, big enough for `size` bytes, with a
+- * reference that the caller owns. It grows, and the launches that are already
+- * recorded keep the one they use.
++/* A scratch BO of the ray tracing launches in `dev_bo`, big enough for `size`
++ * bytes, with a reference that the caller owns. It grows, and the launches
++ * that are already recorded keep the one they use.
+  */
+ static VkResult
+-tu_get_rt_aqe_bo(struct tu_device *dev, uint64_t size, struct tu_bo **bo)
++tu_get_rt_bo(struct tu_device *dev, struct tu_bo **dev_bo, uint64_t size,
++             VkMemoryPropertyFlags flags, const char *name, struct tu_bo **bo)
+ {
+    VkResult result = VK_SUCCESS;
+ 
+    mtx_lock(&dev->mutex);
+-   if (!dev->rt_aqe_bo || dev->rt_aqe_bo->size < size) {
++   if (!*dev_bo || (*dev_bo)->size < size) {
+       struct tu_bo *new_bo;
+       result = tu_bo_init_new_explicit_iova(
+-         dev, NULL, &new_bo, ALIGN_POT(size, 1 << 20), 0, 0,
+-         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+-            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+-         TU_BO_ALLOC_INTERNAL_RESOURCE, NULL, "rt_aqe");
++         dev, NULL, &new_bo, ALIGN_POT(size, 1 << 20), 0, 0, flags,
++         TU_BO_ALLOC_INTERNAL_RESOURCE, NULL, name);
+       if (result == VK_SUCCESS) {
+-         if (dev->rt_aqe_bo)
+-            tu_bo_finish(dev, dev->rt_aqe_bo);
+-         dev->rt_aqe_bo = new_bo;
++         if (*dev_bo)
++            tu_bo_finish(dev, *dev_bo);
++         *dev_bo = new_bo;
+       }
+    }
+    if (result == VK_SUCCESS)
+-      *bo = tu_bo_get_ref(dev->rt_aqe_bo);
++      *bo = tu_bo_get_ref(*dev_bo);
+    mtx_unlock(&dev->mutex);
+ 
+    return result;
+@@ -11266,7 +11265,11 @@ tu_trace_rays_aqe(struct tu_cmd_buffer *cmd,
+    const uint64_t scratch1 = size; size += 2 * max_active * s1;
+ 
+    struct tu_bo *bo;
+-   VkResult result = tu_get_rt_aqe_bo(cmd->device, size, &bo);
++   VkResult result = tu_get_rt_bo(
++      cmd->device, &cmd->device->rt_aqe_bo, size,
++      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
++      "rt_aqe", &bo);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd->vk, result);
+       return;
+@@ -11373,6 +11376,79 @@ tu_trace_rays_aqe(struct tu_cmd_buffer *cmd,
+    cmd->state.dirty |= TU_CMD_DIRTY_COMPUTE_DESC_SETS;
+ }
+ 
++/* The most wave slots that an SP hands out to a compute shader with this
++ * register footprint (in vec4 registers), measured on X2-90 under full load.
++ */
++static unsigned
++tu_rt_wave_slots(unsigned regs)
++{
++   static const struct { uint8_t regs, slots; } measured[] = {
++      { 8, 64 }, { 16, 48 }, { 20, 44 }, { 24, 42 }, { 28, 40 }, { 36, 38 }, { 44, 36 },
++   };
++   unsigned slots = 64;
++   for (unsigned i = 0; i < ARRAY_SIZE(measured) && regs >= measured[i].regs; i++)
++      slots = measured[i].slots;
++   return slots;
++}
++
++/* Get the BO of the stack and size the share of GMEM of each wave slot for the
++ * bottom of the stack, see rt_sep_gmem_stack().
++ */
++static VkResult
++tu_rt_gmem_stack(struct tu_cmd_buffer *cmd, const struct ir3_shader_variant *v,
++                 uint32_t stack, uint32_t *ubo)
++{
++   const struct tu_physical_device *phys = cmd->device->physical_device;
++
++   /* The BO has a share for each of the 64 wave slots of an SP, fibers_per_sp
++    * is 64 waves of 64 lanes. The stack is no bigger than what fits in private
++    * memory, which keeps the offsets in the BO within 32 bits.
++    */
++   struct tu_bo *bo;
++   VkResult result = tu_get_rt_bo(
++      cmd->device, &cmd->device->rt_stack_bo,
++      util_next_power_of_two64((uint64_t)phys->info->num_sp_cores * 64 * 64 * stack),
++      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "rt_stack", &bo);
++   if (result != VK_SUCCESS)
++      return result;
++   if (bo != cmd->state.rt_stack_bo) {
++      util_dynarray_append(&cmd->rt_pvtmem_bos, bo);
++      cmd->state.rt_stack_bo = bo;
++   } else {
++      tu_bo_finish(cmd->device, bo);
++   }
++   tu_mesh_ubo_set_va(ubo, TU_RT_UBO_STACK_ADDR, bo->iova);
++
++   /* A wave of 128 lanes takes the registers of two. Two more slots in case
++    * the measurements missed some.
++    */
++   const unsigned regs = (v->info.max_reg + 1 + (v->info.max_half_reg + 2) / 2) *
++                         (v->info.double_threadsize ? 2 : 1);
++   const uint32_t waves = tu_rt_wave_slots(regs) + 2;
++
++   /* Below the CCU and VPC caches, whichever mode the CCU is in. */
++   const uint32_t gmem = MIN2(phys->usable_gmem_size_gmem,
++                              phys->config_sysmem.depth_ccu_offset);
++   uint32_t size = (gmem / (phys->info->num_sp_cores * waves * 64)) & ~15u;
++
++   /* Where shaders see GMEM. MSM_PARAM_GMEM_BASE is 0 since A650, the msm
++    * kernel puts it at 64 MiB on A8XX.
++    */
++   const uint64_t gmem_va = phys->gmem_base ? phys->gmem_base : 64 * 1024 * 1024;
++   if (gmem_va + gmem > UINT32_MAX)
++      size = 0;
++
++   ubo[TU_RT_UBO_GMEM_STACK_ADDR] = gmem_va;
++   ubo[TU_RT_UBO_GMEM_STACK_SIZE] = MIN2(size, stack);
++   ubo[TU_RT_UBO_GMEM_STACK_WAVES] = waves;
++
++   if (cmd->device->rt_log) {
++      mesa_logi_once("rt_pipeline: gmem stack %u of %u bytes, %u regs, %u wave slots, "
++                     "%u bytes of GMEM", MIN2(size, stack), stack, regs, waves, gmem);
++   }
++   return VK_SUCCESS;
++}
++
+ /* Launch the rays with the direct dimensions, or from the command at
+  * indirect_va. The shader binding tables are at `sbt`, if they are not in the
+  * indirect command.
+@@ -11439,7 +11515,18 @@ tu_trace_rays(struct tu_cmd_buffer *cmd,
+       ubo.map[TU_RT_UBO_STACK_BASE] = v->pvtmem_size;
+       ubo.map[TU_RT_UBO_STACK_LIMIT] = v->pvtmem_size + size;
+ 
+-      result = tu_get_pvtmem(cmd->device, &pvtmem, &bo, v->pvtmem_size + size,
++      /* The GMEM stack keeps the stack out of private memory. */
++      uint32_t pvtmem_size = v->pvtmem_size + size;
++      if (cmd->device->rt_gmem_stack) {
++         result = tu_rt_gmem_stack(cmd, v, size, ubo.map);
++         if (result != VK_SUCCESS) {
++            vk_command_buffer_set_error(&cmd->vk, result);
++            return;
++         }
++         pvtmem_size = v->pvtmem_size;
++      }
++
++      result = tu_get_pvtmem(cmd->device, &pvtmem, &bo, pvtmem_size,
+                              v->pvtmem_per_wave);
+       if (result != VK_SUCCESS) {
+          vk_command_buffer_set_error(&cmd->vk, result);
+@@ -11472,6 +11559,16 @@ tu_trace_rays(struct tu_cmd_buffer *cmd,
+    tu_cs_emit_state_ib(&cmd->cs, shader->state);
+    tu_dispatch<CHIP>(cmd, &info);
+ 
++   /* The dispatch isn't marked as using GMEM: with the msm kernel on A8XX,
++    * preemption then faults while saving GMEM and the GPU hangs.
++    *
++    * The tiles of a later GMEM render pass must not be loaded while the
++    * rays still use GMEM. The ones of an earlier one are stored by now, it
++    * waits for idle after each tile.
++    */
++   if (cmd->device->rt_gmem_stack && cmd->state.rt_stack_default)
++      cmd->state.cache.flush_bits |= TU_CMD_FLAG_WAIT_FOR_IDLE;
++
+    if (cmd->state.shaders[MESA_SHADER_COMPUTE])
+       tu_cs_emit_state_ib(&cmd->cs,
+                           cmd->state.shaders[MESA_SHADER_COMPUTE]->state);
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index e4b85bf20d9..bc16735b540 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -516,6 +516,9 @@ struct tu_cmd_state
+    struct tu_rt_aqe *rt_aqe;
+    struct tu_bo *rt_aqe_bo;
+ 
++   /* The BO of the stack the last launch used. */
++   struct tu_bo *rt_stack_bo;
++
+    struct tu_program_state program;
+ 
+    struct tu_render_pass_state rp;
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 26b05ec9186..fa14700ac7d 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2791,6 +2791,11 @@ tu_init_rt_mode(struct tu_device *device)
+       } else if (!strcmp(mode, "log"))
+          device->rt_log = true;
+    }
++   /* A8XX keeps the CCU and VPC caches at the top of GMEM in both modes, the
++    * stack goes below them.
++    */
++   device->rt_gmem_stack = device->physical_device->info->chip >= A8XX &&
++                           !TU_DEBUG(NOGMEMSTACK);
+    device->rt_aqe_max_active = debug_get_num_option("TU_RT_AQE_MAX_ACTIVE", 0);
+ 
+    ralloc_free(modes);
+@@ -3553,6 +3558,8 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
+ 
+    if (device->rt_aqe_bo)
+       tu_bo_finish(device, device->rt_aqe_bo);
++   if (device->rt_stack_bo)
++      tu_bo_finish(device, device->rt_stack_bo);
+ 
+    tu_destroy_clear_blit_shaders(device);
+ 
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index ec9912c55e8..2ea46891bef 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -406,6 +406,11 @@ struct tu_device
+    enum tu_rt_mode rt_mode;
+    bool rt_log;
+ 
++   /* The bottom of the separate mode stack is in GMEM (A8XX, unless
++    * TU_DEBUG=nogmemstack).
++    */
++   bool rt_gmem_stack;
++
+    /* The scratch of the AQE mode launches: the state of the rays, the
+     * tables and the pending lists. It grows, the command buffers that use a
+     * generation of it keep a reference. TU_RT_AQE_MAX_ACTIVE sets a smaller
+@@ -414,6 +419,11 @@ struct tu_device
+    struct tu_bo *rt_aqe_bo;
+    uint32_t rt_aqe_max_active;
+ 
++   /* The stack of the separate mode launches, the part that is not in GMEM.
++    * It grows like rt_aqe_bo.
++    */
++   struct tu_bo *rt_stack_bo;
++
+    uint32_t vsc_draw_strm_pitch;
+    uint32_t vsc_prim_strm_pitch;
+    BITSET_DECLARE(custom_border_color, TU_BORDER_COLOR_COUNT);
+diff --git a/src/freedreno/vulkan/tu_rt_pipeline.cc b/src/freedreno/vulkan/tu_rt_pipeline.cc
+index 173bfa5566e..9e398058a30 100644
+--- a/src/freedreno/vulkan/tu_rt_pipeline.cc
++++ b/src/freedreno/vulkan/tu_rt_pipeline.cc
+@@ -1442,6 +1442,8 @@ tu_rt_compile(struct tu_device *dev, struct tu_rt_pipeline *pipeline,
+       if (separate) {
+          uint32_t *stack = rzalloc_array(mem_ctx, uint32_t, pipeline->stage_count);
+          nir = rt_build_separate(&link, raygens, num_raygens, stack, &stats);
++         if (dev->rt_gmem_stack)
++            rt_sep_gmem_stack(nir, dev->physical_device->info->num_sp_cores);
+ 
+          rt_store_stacks(pipeline, &link, stack);
+          rt_compute_stack(pipeline, info);
+diff --git a/src/freedreno/vulkan/tu_rt_pipeline.h b/src/freedreno/vulkan/tu_rt_pipeline.h
+index e56f7f5799e..cf91e259f5b 100644
+--- a/src/freedreno/vulkan/tu_rt_pipeline.h
++++ b/src/freedreno/vulkan/tu_rt_pipeline.h
+@@ -199,6 +199,12 @@ nir_shader *
+ rt_build_separate(struct rt_link *link, const unsigned *raygens,
+                   unsigned num_raygens, uint32_t *stack, struct rt_stats *stats);
+ 
++/* Keep the bottom of the stack of the separate mode in GMEM, with `num_sps`
++ * SPs.
++ */
++void
++rt_sep_gmem_stack(nir_shader *nir, unsigned num_sps);
++
+ /* Build the programs of the AQE mode: the traversal, the starter of the rays and
+  * the recycler, then the piece that each case of the separate mode is. The stack
+  * that each stage needs is returned in `stack`, and the size of the state of a
+diff --git a/src/freedreno/vulkan/tu_rt_separate.cc b/src/freedreno/vulkan/tu_rt_separate.cc
+index db8d94a2295..c3d55aa2c20 100644
+--- a/src/freedreno/vulkan/tu_rt_separate.cc
++++ b/src/freedreno/vulkan/tu_rt_separate.cc
+@@ -913,6 +913,203 @@ rt_build_separate(struct rt_link *link, const unsigned *raygens,
+    return nir;
+ }
+ 
++/* GMEM stack: the stack is in global memory instead of
++ * private memory, and the bottom of the stack of each thread, where most of the
++ * accesses are, is in GMEM. Each wave slot of each SP has a share of each: of a
++ * BO for 64 wave slots, all that an SP has, and of a region of GMEM for the
++ * slots that the register footprint allows. Dword i of a lane is next to dword
++ * i of the other lanes of the wave, like in private memory. A thread whose slot
++ * doesn't fit in GMEM uses the BO for its whole stack, so a wrong count of
++ * slots costs speed but not correctness.
++ *
++ * An access picks the memory with a select, which is cheaper than a branch
++ * around it. Which memory a byte is in only depends on where it is, so that all
++ * the accesses to it agree: the share of GMEM is a multiple of 16 bytes, and an
++ * access that may cross 16 aligned bytes is split.
++ */
++struct rt_gmem_stack {
++   /* The region of GMEM (32 bits) and the BO, and the offset of the share of
++    * the thread in each. The address that a lane accesses is the same for all
++    * of them and only the offset depends on the lane, which keeps the accesses
++    * of a wave together.
++    */
++   nir_def *gmem, *global;
++   nir_def *gmem_offset, *global_offset;
++
++   /* The bytes at the start of the stack that are in GMEM, 0 if none. */
++   nir_def *size;
++
++   /* Where the stack starts in private memory, which the addresses are
++    * relative to.
++    */
++   nir_def *base;
++};
++
++static bool
++rt_gmem_within_16(unsigned align_mul, unsigned align_offset, unsigned bytes)
++{
++   const unsigned mul = MIN2(align_mul, 16);
++   return align_offset % mul + bytes <= mul;
++}
++
++/* Load or store (`value`) `num_components` of `bit_size` at `addr`, which are
++ * dwords within 16 aligned bytes, or one smaller component.
++ */
++static nir_def *
++rt_gmem_access(nir_builder *b, const struct rt_gmem_stack *gs, nir_def *addr,
++               unsigned num_components, unsigned bit_size, nir_def *value)
++{
++   nir_def *rel = nir_isub(b, addr, gs->base);
++   nir_def *in_gmem = nir_ult(b, rel, gs->size);
++   nir_def *ptr = nir_pack_64_2x32_split(
++      b, nir_bcsel(b, in_gmem, gs->gmem, nir_unpack_64_2x32_split_x(b, gs->global)),
++      nir_bcsel(b, in_gmem, nir_imm_int(b, 0), nir_unpack_64_2x32_split_y(b, gs->global)));
++
++   nir_def *offset = nir_bcsel(b, in_gmem, gs->gmem_offset, gs->global_offset);
++   if (bit_size == 32) {
++      offset = nir_iadd(b, offset, nir_ishl_imm(b, rel, 6));
++   } else {
++      offset = nir_iadd(b, offset,
++                        nir_iadd(b, nir_ishl_imm(b, nir_iand_imm(b, rel, ~3u), 6),
++                                 nir_iand_imm(b, rel, 3)));
++   }
++
++   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
++   for (unsigned i = 0; i < num_components; i++) {
++      nir_def *comp_offset = nir_iadd_imm(b, offset, i * 256);
++      if (value) {
++         nir_store_global_offset(b, nir_channel(b, value, i), ptr, comp_offset,
++                                 .write_mask = 1, .align_mul = bit_size / 8);
++      } else {
++         comps[i] = nir_load_global_offset(b, 1, bit_size, ptr, comp_offset,
++                                           .align_mul = bit_size / 8);
++      }
++   }
++   return value ? NULL : nir_vec(b, comps, num_components);
++}
++
++static void
++rt_gmem_lower(nir_builder *b, const struct rt_gmem_stack *gs, nir_intrinsic_instr *intr)
++{
++   const bool store = intr->intrinsic == nir_intrinsic_store_scratch;
++   nir_def *value = store ? intr->src[0].ssa : NULL;
++   nir_def *addr = intr->src[store ? 1 : 0].ssa;
++   const unsigned bit_size = store ? value->bit_size : intr->def.bit_size;
++   const unsigned num_components = store ? value->num_components : intr->def.num_components;
++   unsigned mask = store ? nir_intrinsic_write_mask(intr) : BITFIELD_MASK(num_components);
++   const unsigned align_mul = nir_intrinsic_align_mul(intr);
++   const unsigned align_offset = nir_intrinsic_align_offset(intr);
++
++   b->cursor = nir_before_instr(&intr->instr);
++
++   /* Smaller components are accessed one by one. */
++   if (bit_size < 32) {
++      nir_def *comps[NIR_MAX_VEC_COMPONENTS] = {};
++      u_foreach_bit (i, mask) {
++         comps[i] = rt_gmem_access(b, gs, nir_iadd_imm(b, addr, i * bit_size / 8), 1,
++                                   bit_size, store ? nir_channel(b, value, i) : NULL);
++      }
++      if (store)
++         nir_instr_remove(&intr->instr);
++      else
++         nir_def_replace(&intr->def, nir_vec(b, comps, num_components));
++      return;
++   }
++
++   /* The others as dwords, in pieces that don't cross 16 aligned bytes. */
++   const unsigned per_comp = bit_size / 32;
++   const unsigned num_dwords = num_components * per_comp;
++   nir_def *dwords = value ? nir_bitcast_vector(b, value, 32) : NULL;
++   unsigned dword_mask = 0;
++   u_foreach_bit (i, mask)
++      dword_mask |= BITFIELD_RANGE(i * per_comp, per_comp);
++
++   nir_def *loaded[NIR_MAX_VEC_COMPONENTS * 2] = {};
++   for (unsigned i = 0; i < num_dwords;) {
++      if (!(dword_mask & BITFIELD_BIT(i))) {
++         i++;
++         continue;
++      }
++
++      const unsigned offset = align_offset + i * 4;
++      unsigned n = 1;
++      while (i + n < num_dwords && (dword_mask & BITFIELD_BIT(i + n)) &&
++             rt_gmem_within_16(align_mul, offset % align_mul, (n + 1) * 4))
++         n++;
++
++      nir_def *res = rt_gmem_access(b, gs, nir_iadd_imm(b, addr, i * 4), n, 32,
++                                    dwords ? nir_channels(b, dwords, BITFIELD_RANGE(i, n)) : NULL);
++      for (unsigned j = 0; j < n && res; j++)
++         loaded[i + j] = nir_channel(b, res, j);
++      i += n;
++   }
++
++   if (store) {
++      nir_instr_remove(&intr->instr);
++   } else {
++      nir_def_replace(&intr->def,
++                      nir_bitcast_vector(b, nir_vec(b, loaded, num_dwords), bit_size));
++   }
++}
++
++void
++rt_sep_gmem_stack(nir_shader *nir, unsigned num_sps)
++{
++   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
++   struct util_dynarray accesses;
++   util_dynarray_init(&accesses, NULL);
++
++   nir_foreach_block (block, impl) {
++      nir_foreach_instr (instr, block) {
++         if (instr->type != nir_instr_type_intrinsic)
++            continue;
++         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++         if (intr->intrinsic != nir_intrinsic_load_scratch &&
++             intr->intrinsic != nir_intrinsic_store_scratch)
++            continue;
++
++         /* The ones at a constant address are to the hit attributes, which
++          * stay in private memory, below the stack.
++          */
++         const bool store = intr->intrinsic == nir_intrinsic_store_scratch;
++         if (!nir_src_is_const(intr->src[store ? 1 : 0]))
++            util_dynarray_append(&accesses, intr);
++      }
++   }
++
++   /* The workgroup is a wave, and its invocations are the lanes. */
++   static_assert(TU_RT_WORKGROUP_SIZE * TU_RT_WORKGROUP_SIZE == 64, "a wave per workgroup");
++
++   nir_builder b = nir_builder_at(nir_before_impl(impl));
++   nir_def *base = nir_load_scratch_base_ptr(&b, 1, 32, TU_RT_UBO_STACK_BASE);
++   nir_def *stack = nir_isub(&b, nir_load_scratch_base_ptr(&b, 1, 32, TU_RT_UBO_STACK_LIMIT),
++                             base);
++   nir_def *size = nir_load_scratch_base_ptr(&b, 1, 32, TU_RT_UBO_GMEM_STACK_SIZE);
++   nir_def *waves = nir_load_scratch_base_ptr(&b, 1, 32, TU_RT_UBO_GMEM_STACK_WAVES);
++   nir_def *sp = nir_load_sm_id_nv(&b);
++   nir_def *wave = nir_load_warp_id_nv(&b);
++   nir_def *lane = nir_ishl_imm(&b, nir_load_local_invocation_index(&b), 2);
++   nir_def *fits = nir_iand(&b, nir_ult(&b, wave, waves), nir_ult_imm(&b, sp, num_sps));
++
++   nir_def *gmem_slot = nir_iadd(&b, nir_imul(&b, sp, waves), wave);
++   nir_def *global_slot = nir_iadd(&b, nir_ishl_imm(&b, sp, 6), wave);
++
++   struct rt_gmem_stack gs = {
++      .gmem = nir_load_scratch_base_ptr(&b, 1, 32, TU_RT_UBO_GMEM_STACK_ADDR),
++      .global = nir_load_scratch_base_ptr(&b, 1, 64, TU_RT_UBO_STACK_ADDR),
++      .gmem_offset = nir_iadd(&b, nir_imul(&b, gmem_slot, nir_ishl_imm(&b, size, 6)), lane),
++      .global_offset = nir_iadd(&b, nir_imul(&b, global_slot, nir_ishl_imm(&b, stack, 6)), lane),
++      .size = nir_bcsel(&b, fits, size, nir_imm_int(&b, 0)),
++      .base = base,
++   };
++
++   util_dynarray_foreach (&accesses, nir_intrinsic_instr *, intr)
++      rt_gmem_lower(&b, &gs, *intr);
++   util_dynarray_fini(&accesses);
++
++   nir_progress(true, impl, nir_metadata_none);
++}
++
+ /* AQE mode: the AQE firmware runs the cases as separate programs. It has a list
+  * of the threads (their IDs) that wait for each program and dispatches the
+  * program with the most, with the IDs in a list of u16 and a few constants
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index ca9c2878805..76ccfec576c 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -79,7 +79,7 @@ enum tu_mesh_ubo_dword {
+    TU_MESH_UBO_TASK_VERTS_PER_GROUP = 17,
+    TU_MESH_UBO_TASK_MESH_DIMS = 18,
+    TU_MESH_UBO_TASK_XYZ = 20,
+-   TU_MESH_UBO_DWORDS = 24,
++   TU_MESH_UBO_DWORDS = 32,
+ };
+ 
+ /* Layout of the launch UBO of a ray tracing pipeline, which is read through
+@@ -103,6 +103,15 @@ enum tu_rt_ubo_dword {
+ 
+    /* Where the stack starts, after the private memory of the shader. */
+    TU_RT_UBO_STACK_BASE = 23,
++
++   /* The stack in GMEM and global memory: the BO of the stack, the GMEM
++    * address of the region for its bottom, the bytes of each thread there (0 if
++    * none) and the wave slots of each SP that have a share of it.
++    */
++   TU_RT_UBO_STACK_ADDR = 24,
++   TU_RT_UBO_GMEM_STACK_ADDR = 26,
++   TU_RT_UBO_GMEM_STACK_SIZE = 27,
++   TU_RT_UBO_GMEM_STACK_WAVES = 28,
+ };
+ 
+ /* The UBO of the shader that reads an indirect launch. */
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index c7c3dfbcf85..d834d3a439b 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -58,6 +58,7 @@ static const struct debug_control tu_debug_options[] = {
+    { "computeroundrobin", TU_DEBUG_COMPUTE_ROUND_ROBIN },
+    { "gmem_warmup", TU_DEBUG_GMEM_WARMUP },
+    { "deck_emu", TU_DEBUG_DECK_EMU },
++   { "nogmemstack", TU_DEBUG_NOGMEMSTACK },
+    { NULL, 0 }
+ };
+ 
+diff --git a/src/freedreno/vulkan/tu_util.h b/src/freedreno/vulkan/tu_util.h
+index 2dfe62d1eb6..36ccce1b3b2 100644
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -76,6 +76,7 @@ enum tu_debug_flags : uint64_t
+    TU_DEBUG_COMPUTE_ROUND_ROBIN      = BITFIELD64_BIT(37),
+    TU_DEBUG_GMEM_WARMUP              = BITFIELD64_BIT(38),
+    TU_DEBUG_DECK_EMU                 = BITFIELD64_BIT(39),
++   TU_DEBUG_NOGMEMSTACK              = BITFIELD64_BIT(40),
+ };
+ 
+ #define TU_EXPERIMENTAL(name) unlikely(tu_env.experimental & TU_EXPERIMENTAL_##name)
+-- 
+2.53.0
+

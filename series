@@ -26,3 +26,7 @@ patches/performance/0025-ir3-do-uniform-address-atomics-once-per-subgroup-in-.pa
 patches/ray_stack/0026-ir3-isa-add-the-a8xx-ray_stack-instruction.patch
 patches/ray_stack/0027-ir3-add-ray_stack_ir3-and-reserve-its-state-block.patch
 patches/ray_stack/0028-tu-traverse-the-BVH-with-ray_stack-on-a8xx.patch
+patches/gmem_stack/0029-ir3-emit-getspid-and-getwid-for-the-SM-and-warp-ID-i.patch
+patches/gmem_stack/0030-tu-fix-the-alignment-of-the-separate-mode-stack-acce.patch
+patches/gmem_stack/0031-tu-keep-the-bottom-of-the-separate-mode-ray-tracing-.patch
+patches/ray_tracing_pipeline/0032-ir3-encode-the-coherent-bit-of-global-atomics.patch

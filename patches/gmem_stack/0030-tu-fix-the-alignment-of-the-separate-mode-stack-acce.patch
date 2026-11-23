@@ -1,0 +1,67 @@
+From 41087ad460c9d1b2e4be2810becf34fb80b93329 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 22 Nov 2026 21:24:21 +0200
+Subject: [PATCH 30/32] tu: fix the alignment of the separate mode stack
+ accesses
+
+The alignment that a stack access claims is wrong when its frame was
+moved after the access was made: a vec4 store at sp + 44 claimed to be
+at a multiple of 2^30. The stack pointer and the offsets of the inlined
+shaders are multiples of 16, which gives the exact alignment of the
+accesses at a constant offset, and of the headers. Only the alignment
+of the components is known for the other ones.
+---
+ src/freedreno/vulkan/tu_rt_separate.cc | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/src/freedreno/vulkan/tu_rt_separate.cc b/src/freedreno/vulkan/tu_rt_separate.cc
+index 176605ee2d5..db8d94a2295 100644
+--- a/src/freedreno/vulkan/tu_rt_separate.cc
++++ b/src/freedreno/vulkan/tu_rt_separate.cc
+@@ -87,17 +87,19 @@ struct rt_sep {
+    struct rt_keys keys[MESA_ALL_SHADER_STAGES];
+ };
+ 
++/* The headers are at multiples of 16 bytes, like the frames. */
+ static nir_def *
+ rt_stack_load(nir_builder *b, nir_def *addr, unsigned offset)
+ {
+-   return nir_load_scratch(b, 1, 32, nir_iadd_imm(b, addr, offset), .align_mul = 4);
++   return nir_load_scratch(b, 1, 32, nir_iadd_imm(b, addr, offset), .align_mul = 16,
++                           .align_offset = offset % 16);
+ }
+ 
+ static void
+ rt_stack_store(nir_builder *b, nir_def *addr, unsigned offset, nir_def *value)
+ {
+-   nir_store_scratch(b, value, nir_iadd_imm(b, addr, offset), .align_mul = 4,
+-                     .write_mask = 1);
++   nir_store_scratch(b, value, nir_iadd_imm(b, addr, offset), .align_mul = 16,
++                     .align_offset = offset % 16, .write_mask = 1);
+ }
+ 
+ /* Choose the key of `keys` that `id` is with a balanced tree and run `leaf`
+@@ -452,6 +454,20 @@ rt_rebase_scratch(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+       return false;
+    }
+ 
++   /* The alignment that the access claims is wrong when the frame was moved
++    * after the access was made. The stack pointer and `extra` are multiples
++    * of 16, which gives the alignment of an access at a constant offset. The
++    * data of the caller can be anywhere in its frame, so only the alignment of
++    * the components is known for the other ones.
++    */
++   if (nir_src_is_const(intr->src[src])) {
++      nir_intrinsic_set_align(intr, 16,
++                              (state->extra + nir_src_as_uint(intr->src[src])) % 16);
++   } else {
++      const unsigned mul = MIN2(nir_intrinsic_align_mul(intr), 4);
++      nir_intrinsic_set_align(intr, mul, nir_intrinsic_align_offset(intr) % mul);
++   }
++
+    b->cursor = nir_before_instr(&intr->instr);
+    nir_def *base = nir_iadd_imm(b, nir_load_var(b, state->rg->sp), state->extra);
+    nir_src_rewrite(&intr->src[src], nir_iadd(b, base, intr->src[src].ssa));
+-- 
+2.53.0
+

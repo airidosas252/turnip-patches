@@ -1,0 +1,70 @@
+From dcf1c44efa81171f7bac3d1750a61d6ae4b97c38 Mon Sep 17 00:00:00 2001
+From: airidosas252 <airidaslideikis@gmail.com>
+Date: Sun, 22 Nov 2026 21:05:47 +0200
+Subject: [PATCH 29/32] ir3: emit getspid and getwid for the SM and warp ID
+ intrinsics
+
+They tell a shader which SP and which wave slot it runs on. Like
+getfiberid, they need (ss) and aren't memory instructions.
+---
+ src/freedreno/ir3/ir3.h              |  8 ++++++--
+ src/freedreno/ir3/ir3_compiler_nir.c | 10 ++++++++++
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/freedreno/ir3/ir3.h b/src/freedreno/ir3/ir3.h
+index a0b1886ad7c..eb9aea62ea5 100644
+--- a/src/freedreno/ir3/ir3.h
++++ b/src/freedreno/ir3/ir3.h
+@@ -1415,7 +1415,8 @@ is_mov(struct ir3_instruction *instr)
+ static inline bool
+ is_sfu(struct ir3_instruction *instr)
+ {
+-   return (opc_cat(instr->opc) == 4) || instr->opc == OPC_GETFIBERID;
++   return (opc_cat(instr->opc) == 4) || instr->opc == OPC_GETFIBERID ||
++          instr->opc == OPC_GETSPID || instr->opc == OPC_GETWID;
+ }
+ 
+ static inline bool
+@@ -1448,7 +1449,8 @@ is_tex_or_prefetch(struct ir3_instruction *instr)
+ static inline bool
+ is_mem(struct ir3_instruction *instr)
+ {
+-   return (opc_cat(instr->opc) == 6) && instr->opc != OPC_GETFIBERID;
++   return (opc_cat(instr->opc) == 6) && instr->opc != OPC_GETFIBERID &&
++          instr->opc != OPC_GETSPID && instr->opc != OPC_GETWID;
+ }
+ 
+ static inline bool
+@@ -3152,6 +3154,8 @@ ir3_BRCST_ACTIVE(struct ir3_builder *build, unsigned cluster_size,
+ 
+ /* cat6 instructions: */
+ INSTR0(GETFIBERID)
++INSTR0(GETSPID)
++INSTR0(GETWID)
+ INSTR2(LDLV)
+ INSTR3(LDG)
+ INSTR3(LDL)
+diff --git a/src/freedreno/ir3/ir3_compiler_nir.c b/src/freedreno/ir3/ir3_compiler_nir.c
+index 1a48a7ba027..62b4b3e3f44 100644
+--- a/src/freedreno/ir3/ir3_compiler_nir.c
++++ b/src/freedreno/ir3/ir3_compiler_nir.c
+@@ -3183,6 +3183,16 @@ emit_intrinsic(struct ir3_context *ctx, nir_intrinsic_instr *intr)
+       dst[0]->cat6.type = TYPE_U32;
+       __ssa_dst(dst[0]);
+       break;
++   case nir_intrinsic_load_sm_id_nv:
++      dst[0] = ir3_GETSPID(b);
++      dst[0]->cat6.type = TYPE_U32;
++      __ssa_dst(dst[0]);
++      break;
++   case nir_intrinsic_load_warp_id_nv:
++      dst[0] = ir3_GETWID(b);
++      dst[0]->cat6.type = TYPE_U32;
++      __ssa_dst(dst[0]);
++      break;
+    case nir_intrinsic_load_tess_level_outer_default:
+       for (int i = 0; i < dest_components; i++) {
+          dst[i] = create_driver_param(ctx, IR3_DP_TCS(default_outer_level_x) + i);
+-- 
+2.53.0
+

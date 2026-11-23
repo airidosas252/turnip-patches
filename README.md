@@ -1,26 +1,19 @@
 # Turnip patches for A8XX
 
-Patches for Mesa's Turnip Vulkan driver on Adreno A8XX GPUs. They add mesh
-shaders, fragment shader barycentrics and 64-bit shared atomics, fix a few
-things, and add an experimental ray tracing pipeline.
-
-I developed and tested them on a Snapdragon X2 Elite Extreme laptop (Adreno
-X2-90), and some of the earlier work also on an Adreno 840 phone. Other A8XX
-devices should work in principle, but your mileage will vary.
+Patches for Mesa's Turnip Vulkan driver on Adreno A8XX GPUs: mesh shaders,
+fragment shader barycentrics, 64-bit shared atomics, experimental ray tracing
+pipelines and some fixes. Developed and tested on a Snapdragon X2 Elite Extreme
+laptop (Adreno X2-90), partly also on an Adreno 840 phone.
 
 They apply on top of upstream Mesa main at `6c2135ab766` ("ac: fix off-by-one
 guardband computation", 2026-11-20).
 
-## Warning
-
-Use these at your own risk. I can't promise they'll work for you. Most of the
-testing was Vulkan CTS plus a handful of games that use these features, and a
-lot of it is still work in progress.
+Use at your own risk. Testing was mostly Vulkan CTS and a handful of games,
+and much of this is still work in progress.
 
 ## Applying
 
-The patches are in folders by feature, and `series` lists all of them in the
-order they apply. From a Mesa checkout:
+`series` lists every patch in order. From a Mesa checkout:
 
 ```
 git checkout -b turnip-a8xx 6c2135ab766
@@ -28,190 +21,111 @@ TP=/path/to/turnip-patches
 git am $(sed "s|^|$TP/|" $TP/series)
 ```
 
-The A840 and X2-90 also need upstream MR !46551, Artem Peshkov's fix for the
-A8XX VPC position cache size. It isn't in this series, so apply it as well
-until it lands upstream.
+Also apply upstream MR !46551 (Artem Peshkov's A8XX VPC position cache size
+fix) until it lands.
 
-### Picking only some folders
+## What you need for what
 
-`fixes`, `x2-90`, `shader_int64_atomics` and `fully_covered` apply on their
-own, in any combination:
+| Feature | Patches |
+|---------|---------|
+| Ray tracing pipelines | The whole series. Only `shader_int64_atomics` and `fully_covered` can be left out |
+| Mesh shaders, barycentrics | 0001 to 0009, in order |
+| 64-bit shared atomics | `shader_int64_atomics`, applies on its own |
+| Fully covered fragments | `fully_covered`, applies on its own |
+| X2-90 support | `x2-90`, applies on its own |
+| Upstream bug fixes | `fixes`, applies on its own |
 
-```
-git am $TP/patches/fixes/*.patch $TP/patches/x2-90/*.patch
-```
+Everything not listed as "on its own" only applies in `series` order.
 
-The rest build on each other. `mesh_shader`, `fragment_shader_barycentric`,
-`subgroups`, `performance`, `ray_tracing_pipeline`, `ray_stack` and
-`gmem_stack` (0001 to 0011, plus 0025 to 0032) only apply together and in
-`series` order. In `local`, 0014 needs the
-mesh and barycentric patches, while 0012 and 0013 apply on their own.
+### Ray tracing pipelines
 
-## Patches
+The extension itself is 0010 and 0011, but it needs the rest to be usable
+and fast:
 
-The numbers keep the order of the whole series.
+| Patches | Why |
+|---------|-----|
+| 0001 to 0009 | 0011 is built on top of them |
+| 0010, 0011 | `VK_KHR_ray_tracing_pipeline` |
+| 0032 | Fixes slow global atomics that 0011 caused (Quake II RTX ray queries 45 to 59 FPS) |
+| 0021, 0022 | Big pipelines (Cyberpunk 2077) compile without running out of memory, about 5x faster |
+| 0023 | Fixes GPU faults after acceleration structure compaction |
+| 0024, 0025 | Acceleration structure builds 15 to 25x faster |
+| 0026 to 0028 | Hardware BVH traversal step, 10 to 17% faster |
+| 0029 to 0031 | Ray stack in GMEM, up to 2x faster with big payloads |
+| 0012 | 0031 doesn't apply without it |
+| 0015 | Fixes a GPU hang on the X2-90 |
 
-**mesh_shader**
-
-| # | What | Comments |
-|---|------|----------|
-| 0001 | `VK_EXT_mesh_shader` for A8XX | WIP, needs more testing |
-| 0006 | Extend the native A8XX mesh path | |
-| 0009 | Use the native mesh path only when the kernel enabled the AQE | |
-
-**fragment_shader_barycentric**
-
-| # | What | Comments |
-|---|------|----------|
-| 0002 | `VK_KHR_fragment_shader_barycentric` for A8XX | WIP, needs more testing |
-| 0004 | Fix memory growth, XFB and mesh keys with barycentric libraries | |
-
-**subgroups**
-
-| # | What | Comments |
-|---|------|----------|
-| 0003 | Emulate 32-wide subgroups on A8XX | |
-
-**performance**
-
-| # | What | Comments |
-|---|------|----------|
-| 0007 | Reduce fragment preamble cost | |
-| 0025 | ir3: do uniform-address atomics once per subgroup in compute shaders | Big acceleration structure builds 15-25x faster, needs 0024 |
-
-**ray_tracing_pipeline**
-
-| # | What | Comments |
-|---|------|----------|
-| 0010 | nir: keep hit attribute writes alive across `report_ray_intersection` | |
-| 0011 | `VK_KHR_ray_tracing_pipeline` for A8XX | Experimental, see below |
-| 0032 | ir3: encode the coherent bit of global atomics | Fixes every global atomic being slow since 0011 |
-
-0011 made every global atomic in every shader take the slow coherent path that
-only the AQE needs, because the encoder never wrote the bit that picks it. That
-cost Quake II RTX ray queries 59 to 45 FPS until 0025 hid most of it. 0032 puts
-normal atomics back to what upstream emits.
-
-**ray_stack**
-
-| # | What | Comments |
-|---|------|----------|
-| 0026 | ir3/isa: add the A8XX `ray_stack` instruction | |
-| 0027 | ir3: add `ray_stack_ir3` and reserve its state block | |
-| 0028 | Traverse the BVH with `ray_stack` on A8XX | Ray queries and RT pipelines 10-17% faster |
-
-These use an undocumented A8XX instruction that does one step of BVH traversal
-in hardware, the way Qualcomm's driver does. It replaces the traversal stack in
-the shader. The stack lives in a block of 12 registers shared by the whole wave,
-so the compiler keeps that block out of register allocation. Shaders with more
-than one ray query keep the old path.
-
-**gmem_stack**
-
-| # | What | Comments |
-|---|------|----------|
-| 0029 | ir3: emit `getspid` and `getwid` for the SM and warp ID intrinsics | |
-| 0030 | Fix the alignment of the separate mode stack accesses | |
-| 0031 | Keep the bottom of the separate mode ray tracing stack in GMEM | RT pipelines up to 2x faster with big payloads |
-
-The separate mode of 0011 keeps a stack per ray in private memory, which goes
-to DRAM. 0031 puts the first part of each stack, where most accesses go, in
-GMEM (the GPU's on-chip tile memory, several times faster than DRAM) and the
-rest in a driver-owned buffer. On the X2-90 it made test pipelines 3-13%
-faster, about 2x with 256-byte payloads, and Cyberpunk 2077 went from about
-17 to 19 FPS. One test case with 128 hit groups got about 10% slower. It's on
-by default on A8XX, and `TU_DEBUG=nogmemstack` turns it off.
-
-**shader_int64_atomics**
-
-| # | What | Comments |
-|---|------|----------|
-| 0017 | ir3: 64-bit shared memory atomics | |
-| 0018 | Expose `shaderSharedInt64Atomics` on A8XX | |
-| 0019 | ir3: native 64-bit umin/umax atomics on A8XX | |
-
-**fully_covered**
-
-| # | What | Comments |
-|---|------|----------|
-| 0020 | Expose `fullyCoveredFragmentShaderInputVariable` on A8XX | |
-
-**x2-90**
-
-| # | What | Comments |
-|---|------|----------|
-| 0015 | freedreno: full sysmem depth CCU cache on X2-90 | Fixes a GPU hang |
-| 0016 | freedreno: add the X2-90 chip id the laptop kernel reports | |
-
-**fixes**
-
-| # | What | Comments |
-|---|------|----------|
-| 0005 | Use a weak-ref device pipeline cache | |
-| 0008 | kgsl: split bind ranges on sparse unbind | |
-| 0021 | ir3: keep spill next-use distances only for live-in and live-out values | Huge shaders no longer run out of memory |
-| 0022 | ir3: don't rescan the whole shader after every jump change | Huge shaders compile about 5x faster |
-| 0023 | Fix the header pointers when copying an acceleration structure | Fixes GPU faults after compaction |
-| 0024 | nir: only merge atomics when the buffer or image is uniform too | Needed by 0025 |
-
-0021 to 0024 fix bugs that are also in upstream Mesa, so they're worth having
-even without the ray tracing patch. 0023 affects ray queries too.
-
-**local**
-
-| # | What | Comments |
-|---|------|----------|
-| 0012 | `TU_DEBUG=deck_emu` | Local hack |
-| 0013 | `TU_DBG_BOLOG` and `TU_DBG_AS_LOG` debug logging | Local hack |
-| 0014 | Turn mesh_shader, mesh_native and barycentric on by default | Local hack |
-
-These are hacks for my own setup and won't go upstream. Skip them if you only
-want the features.
-
-## Ray tracing pipelines (0011)
-
-This one is experimental. It passes the ray tracing pipeline CTS and runs a few
-small test apps and Quake II RTX. Cyberpunk 2077 also works with every ray
-tracing option (with 0021 to 0023). 0025 made it usable: the built-in benchmark
-at 2560x1600, FSR 2.1 Balanced, RT local shadows on, went from 3.5 to 16.9 FPS
-average on the X2-90, and with 0026 to 0031 it's at about 19 FPS. Cronos (a 46-stage pipeline) used to run out of memory
-while compiling, and I haven't tried it again since 0021.
+Cyberpunk 2077 benchmark on the X2-90 (2560x1600, FSR 2.1 Balanced, RT local
+shadows): 3.5 FPS with 0011 alone, 16.9 with 0025, about 19 with everything.
+It passes the ray tracing pipeline CTS and runs Quake II RTX.
 
 It's off unless `TU_EXPERIMENTAL` contains `rt_pipeline`.
 
+## Patches
+
+| # | Folder | What |
+|---|--------|------|
+| 0001 | mesh_shader | `VK_EXT_mesh_shader` for A8XX |
+| 0002 | fragment_shader_barycentric | `VK_KHR_fragment_shader_barycentric` for A8XX |
+| 0003 | subgroups | Emulate 32-wide subgroups |
+| 0004 | fragment_shader_barycentric | Fix memory growth, XFB and mesh keys with barycentric libraries |
+| 0005 | fixes | Weak-ref device pipeline cache |
+| 0006 | mesh_shader | Extend the native A8XX mesh path |
+| 0007 | performance | Reduce fragment preamble cost |
+| 0008 | fixes | kgsl: split bind ranges on sparse unbind |
+| 0009 | mesh_shader | Native mesh path only when the kernel enabled the AQE |
+| 0010 | ray_tracing_pipeline | nir: keep hit attribute writes alive across `report_ray_intersection` |
+| 0011 | ray_tracing_pipeline | `VK_KHR_ray_tracing_pipeline` for A8XX |
+| 0012 | local | `TU_DEBUG=deck_emu` |
+| 0013 | local | `TU_DBG_BOLOG` and `TU_DBG_AS_LOG` debug logging |
+| 0014 | local | Turn mesh_shader, mesh_native and barycentric on by default |
+| 0015 | x2-90 | Full sysmem depth CCU cache on X2-90, fixes a GPU hang |
+| 0016 | x2-90 | X2-90 chip id the laptop kernel reports |
+| 0017 | shader_int64_atomics | ir3: 64-bit shared memory atomics |
+| 0018 | shader_int64_atomics | Expose `shaderSharedInt64Atomics` |
+| 0019 | shader_int64_atomics | ir3: native 64-bit umin/umax atomics |
+| 0020 | fully_covered | Expose `fullyCoveredFragmentShaderInputVariable` |
+| 0021 | fixes | ir3: spill keeps next-use distances only for live-in and live-out values |
+| 0022 | fixes | ir3: don't rescan the whole shader after every jump change |
+| 0023 | fixes | Fix header pointers when copying an acceleration structure |
+| 0024 | fixes | nir: merge atomics only when the buffer or image is uniform too |
+| 0025 | performance | ir3: uniform-address atomics once per subgroup in compute |
+| 0026 | ray_stack | ir3/isa: A8XX `ray_stack` instruction |
+| 0027 | ray_stack | ir3: `ray_stack_ir3` and its reserved state block |
+| 0028 | ray_stack | Traverse the BVH with `ray_stack` |
+| 0029 | gmem_stack | ir3: `getspid` and `getwid` for the SM and warp ID intrinsics |
+| 0030 | gmem_stack | Fix alignment of the separate mode stack accesses |
+| 0031 | gmem_stack | Keep the bottom of the separate mode ray stack in GMEM |
+| 0032 | ray_tracing_pipeline | ir3: encode the coherent bit of global atomics |
+
+0021 to 0024 fix bugs that are also in upstream Mesa. `local` holds hacks for
+my own setup that won't go upstream.
+
 ## Environment variables
 
-`TU_EXPERIMENTAL` takes a comma-separated list of:
-
-- `mesh_shader`: `VK_EXT_mesh_shader`
-- `mesh_native`: the native A8XX mesh path, needs a kernel with the AQE enabled
-- `barycentric`: `VK_KHR_fragment_shader_barycentric`
-- `rt_pipeline`: `VK_KHR_ray_tracing_pipeline` (experimental)
-
-Without 0014, everything is off until you set it. With 0014, the default is
-`mesh_shader,mesh_native,barycentric`, and setting the variable replaces that
-list rather than adding to it. So to try ray tracing pipelines, use
+`TU_EXPERIMENTAL` takes a comma-separated list of `mesh_shader`,
+`mesh_native` (needs a kernel with the AQE), `barycentric` and `rt_pipeline`.
+Everything is off by default. With 0014 the default is
+`mesh_shader,mesh_native,barycentric`, and setting the variable replaces it,
+so for ray tracing use
 `TU_EXPERIMENTAL=mesh_shader,mesh_native,barycentric,rt_pipeline`.
 
-These only matter with `rt_pipeline` (0011):
+Ray tracing:
 
-- `TU_RT_MODE` forces how pipelines get compiled: `monolithic`, `separate` or
-  `aqe` (`aqe` needs a kernel with the AQE). Add `log` to print how each
-  pipeline compiled, for example `TU_RT_MODE=separate,log`. By default, small
-  pipelines are monolithic and big ones are separate.
-- `TU_RT_AQE_MAX_ACTIVE=<n>` caps the rays in flight in `aqe` mode. For testing.
-- `TU_DBG_RT_SKIP=1` skips ray tracing dispatches. For debugging.
-- `TU_DEBUG=nogmemstack` keeps the separate mode stack out of GMEM (0031).
+- `TU_RT_MODE=monolithic|separate|aqe` forces how pipelines compile (`aqe`
+  needs the AQE kernel). Add `,log` to print what each pipeline got. By
+  default small pipelines are monolithic and big ones separate.
+- `TU_DEBUG=nogmemstack` keeps the ray stack out of GMEM.
+- `TU_RT_AQE_MAX_ACTIVE=<n>` caps rays in flight in `aqe` mode (testing).
+- `TU_DBG_RT_SKIP=1` skips ray tracing dispatches (debugging).
 
-Debugging (0012, 0013):
+Debugging:
 
-- `TU_DEBUG=deck_emu` makes the driver report a Steam Deck GPU (RADV,
-  0x1002:0x163F).
-- `TU_DBG_BOLOG=<dir>` logs every BO map and unmap to `<dir>/bolog-<pid>.log`.
+- `TU_DEBUG=deck_emu` reports a Steam Deck GPU (RADV, 0x1002:0x163F).
+- `TU_DBG_BOLOG=<dir>` logs BO maps and unmaps to `<dir>/bolog-<pid>.log`.
 - `TU_DBG_AS_LOG=1` logs acceleration structure builds.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). That's the same license as the Mesa code these
-patches change, and the copyright notices already in those Mesa files stay as
-they are.
+MIT, see [LICENSE](LICENSE), the same as the Mesa code these patches change.
+The copyright notices in those Mesa files stay as they are.
